@@ -1,0 +1,17 @@
+<launch>
+    <arg name="camera_topic" default="/camera/image_raw"/>
+    <arg name="camera_info_topic" default="/camera/camera_info"/>
+    <arg name="use_camera_info" default="false"/>
+    <arg name="camera_info_required" default="false"/>
+    <arg name="launch_prefix" default=""/>
+
+    <node pkg="mini_orb_slam" type="mini_orb_node" name="mini_orb_node" output="screen"
+          launch-prefix="$(arg launch_prefix)">
+        <rosparam command="load" file="$(find mini_orb_slam)/config/params.yaml"/>
+        
+        <param name="camera_topic" value="$(arg camera_topic)"/>
+        <param name="camera_info_topic" value="$(arg camera_info_topic)"/>
+        <param name="use_camera_info" value="$(arg use_camera_info)"/>
+        <param name="camera_info_required" value="$(arg camera_info_required)"/>
+    </node>
+</launch>

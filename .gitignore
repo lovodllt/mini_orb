@@ -1,0 +1,13 @@
+build/
+devel/
+logs/
+thirdparty/DBoW2/lib/
+
+# Local project planning and phase records.
+LEARNING_STATUS.md
+MIGRATION_PROMPT.md
+SPRINT_STATUS.md
+docs/
+
+# Local KITTI playback support.
+*[Kk][Ii][Tt][Tt][Ii]*

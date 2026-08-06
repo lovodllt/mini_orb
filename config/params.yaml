@@ -1,0 +1,36 @@
+use_camera_info: false
+camera_info_required: false
+camera_info_topic: "/camera/camera_info"
+
+vocabulary_path: "vocabulary/ORBvoc.txt"
+trajectory_output_path: ""
+trajectory_format: "tum"
+
+relocalization_cooldown_frames: 3
+
+min_relocalization_inliers: 50
+relocalization_guard_frames: 10
+
+orb_extractor:
+  features_num: 1000
+  scale_factor: 1.2
+  levels_num: 8
+  init_th_fast: 20
+  min_th_fast: 7
+
+matcher:
+  ratio_threshold: 0.8
+  max_hamming_distance: 50
+
+mini_orb_slam:
+  min_initial_map_points: 100
+  min_initial_good_point_ratio: 0.5
+  max_initial_reproj_error_px: 2.0
+  min_initial_parallax_deg: 1.0
+  max_init_geometry_failures_per_ref: 3
+  min_init_reference_features: 250
+  min_init_reference_occupied_bins: 6
+
+min_keyframe_gap: 10
+max_tracking_reproj_error: 8.0
+max_relocalization_candidates: 5
