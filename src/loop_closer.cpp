@@ -8,6 +8,7 @@
 #include <opencv4/opencv2/core.hpp>
 
 #include "loop_closer.h"
+#include "local_mapper.h"
 
 namespace mini_orb_slam
 {
@@ -15,11 +16,13 @@ namespace mini_orb_slam
 LoopCloser::LoopCloser(const std::shared_ptr<KeyframeDatabase>& keyframe_database,
                        const Matcher& matcher,
                        const std::shared_ptr<PoseOptimizer>& pose_optimizer,
+                       LocalMapper* local_mapper,
                        double scale_factor,
                        int levels_num)
     : keyframe_database_(keyframe_database),
       matcher_(matcher),
       pose_optimizer_(pose_optimizer),
+      local_mapper_(local_mapper),
       scale_factor_(scale_factor),
       levels_num_(levels_num) {}
 
@@ -84,12 +87,20 @@ bool LoopCloser::insertKeyframe(const LoopClosingInput& input)
 
 bool LoopCloser::tryPopFinishedResult(LoopClosingOutput& output)
 {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    if (finished_results_.empty())
-        return false;
+    // Keep the queue lock limited to ownership transfer. LoopClosingOutput
+    // may contain Sim3 correspondences and matrices; copying it while the
+    // frontend callback holds the queue lock delays the processed-image ACK.
+    LoopClosingOutput ready_output;
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (finished_results_.empty())
+            return false;
 
-    output = finished_results_.front();
-    finished_results_.pop_front();
+        ready_output = std::move(finished_results_.front());
+        finished_results_.pop_front();
+    }
+
+    output = std::move(ready_output);
     return true;
 }
 
@@ -147,49 +158,70 @@ void LoopCloser::run()
             if (output.verification_result.success &&
                 output.verification_result.candidate_keyframe != nullptr)
             {
+                if (local_mapper_ != nullptr)
+                {
+                    // ORB-SLAM2 logic reference: local mapping is stopped
+                    // before loop correction so no stale Local BA can publish
+                    // over the corrected global state.
+                    local_mapper_->requestStop();
+                    while (!local_mapper_->isStopped() && !finish_requested_)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+
                 {
                     std::lock_guard<std::mutex> map_lock(input.map->getMutex());
-
-                    output.correction_result = 
+                    const std::size_t refreshed_constraints =
+                        input.map->refreshPoseGraphMeasurements();
+                    ROS_INFO_STREAM("P2-KITTI-R79 graph_measurements_refreshed="
+                                    << refreshed_constraints
+                                    << " loop_keyframe=" << input.cur_keyframe->getId());
+                    output.correction_result =
                         applyVerifiedLoop(input.map, input.cur_keyframe, output.verification_result);
-                }
-
-                if (output.correction_result.success &&
-                    output.correction_result.registered_loop_edge &&
-                    pose_optimizer_ != nullptr)
-                {
-                    std::vector<std::shared_ptr<Frame>> map_keyframes;
-                    std::vector<std::shared_ptr<MapPoint>> map_points;
-                    std::vector<PoseGraphConstraint> constraints;
-
+                    if (output.correction_result.success &&
+                        output.correction_result.registered_loop_edge &&
+                        pose_optimizer_ != nullptr)
                     {
-                        std::lock_guard<std::mutex> map_lock(input.map->getMutex());
-                        
-                        map_keyframes = input.map->getKeyframes();
-                        map_points = input.map->getMapPoints();
-                        constraints = input.map->getPoseGraphConstraints();
-                    }
+                        const std::vector<std::shared_ptr<Frame>> map_keyframes =
+                            input.map->getKeyframes();
+                        const std::vector<std::shared_ptr<MapPoint>> map_points =
+                            input.map->getMapPoints();
+                        const std::vector<PoseGraphConstraint> constraints =
+                            input.map->getPoseGraphConstraints();
+                        std::shared_ptr<Frame> anchor_keyframe;
 
-                    std::shared_ptr<Frame> anchor_keyframe;
-
-                    for (const auto& keyframe : map_keyframes)
-                    {
-                        if (keyframe != nullptr && keyframe->isKeyframe())
+                        for (const auto& keyframe : map_keyframes)
                         {
-                            anchor_keyframe = keyframe;
-                            break;
+                            if (keyframe != nullptr && keyframe->isKeyframe())
+                            {
+                                anchor_keyframe = keyframe;
+                                break;
+                            }
+                        }
+
+                        if (anchor_keyframe != nullptr)
+                        {
+                            output.graph_optimized =
+                                pose_optimizer_->optimizeEssentialGraph(map_keyframes,
+                                                                        map_points,
+                                                                        constraints,
+                                                                        anchor_keyframe);
+                            if (output.graph_optimized)
+                            {
+                                // Essential-graph optimization changes the
+                                // keyframe poses but does not own Map's
+                                // version counter. Refresh geometry-derived
+                                // measurements and advance the transaction
+                                // generation only after the complete candidate
+                                // has been committed.
+                                input.map->refreshPoseGraphMeasurements();
+                                input.map->markModified();
+                            }
                         }
                     }
-
-                    if (anchor_keyframe != nullptr)
-                    {
-                        output.graph_optimized = 
-                            pose_optimizer_->optimizeEssentialGraph(map_keyframes, 
-                                                                    map_points,
-                                                                    constraints,
-                                                                    anchor_keyframe);
-                    }
                 }
+
+                if (local_mapper_ != nullptr)
+                    local_mapper_->release();
             }
         }
 
@@ -218,8 +250,11 @@ std::unordered_set<std::size_t> LoopCloser::collectConnectedKeyframeIds(
     excluded_ids.reserve(16);
     excluded_ids.insert(keyframe->getId());
 
-    const std::vector<std::shared_ptr<Frame>> neighbors = 
-        keyframe->copyBestCovisibilityKeyframes(10, 1);
+    // ORB-SLAM2 logic reference: exclude the complete directly connected
+    // covisibility set, not only the strongest ten neighbors. This prevents
+    // near-duplicate keyframes from re-entering loop candidate verification.
+    const std::vector<std::shared_ptr<Frame>> neighbors =
+        keyframe->copyConnectedKeyframes(1);
 
     for (const auto& neighbor : neighbors)
     {
@@ -383,6 +418,7 @@ std::vector<std::shared_ptr<Frame>> LoopCloser::detectLoopCandidates(
     if (map == nullptr || cur_keyframe == nullptr || !cur_keyframe->isKeyframe() ||
         keyframe_database_ == nullptr || !cur_keyframe->hasBoW())
     {
+        consistent_loop_groups_.clear();
         return candidates;
     }
 
@@ -400,7 +436,10 @@ std::vector<std::shared_ptr<Frame>> LoopCloser::detectLoopCandidates(
         keyframe_database_->query(cur_keyframe, kMaxSeedCandiates, kMinBowScore);
 
     if (bow_results.empty())
+    {
+        consistent_loop_groups_.clear();
         return candidates;
+    }
 
     std::unordered_map<std::size_t, double> seed_scores;
     seed_scores.reserve(bow_results.size() * 2 + 1);
@@ -417,7 +456,10 @@ std::vector<std::shared_ptr<Frame>> LoopCloser::detectLoopCandidates(
     }
 
     if (seed_scores.empty())
+    {
+        consistent_loop_groups_.clear();
         return candidates;
+    }
 
     std::unordered_map<std::size_t, LoopCandidateGroup> grouped_candidates;
     grouped_candidates.reserve(seed_scores.size() * 2 + 1);
@@ -488,6 +530,50 @@ std::vector<std::shared_ptr<Frame>> LoopCloser::detectLoopCandidates(
     for (const auto& item : grouped_candidates)
         ranked_groups.push_back(item.second);
 
+    // ORB-SLAM2 logic reference: a single BoW match is not a loop.  Keep
+    // covisibility groups across consecutive checks and only expose a group
+    // after it has been observed in three consecutive keyframes.  This also
+    // prevents near-by perceptual aliases from immediately changing the
+    // global pose graph.
+    std::vector<ConsistentLoopGroup> current_consistent_groups;
+    current_consistent_groups.reserve(ranked_groups.size());
+    for (auto& group : ranked_groups)
+    {
+        if (group.representative == nullptr)
+            continue;
+
+        ConsistentLoopGroup current_group;
+        current_group.keyframe_ids.insert(group.representative->getId());
+        for (const auto& neighbor :
+             group.representative->copyBestCovisibilityKeyframes(kMaxNeighborNum, 1))
+        {
+            if (neighbor != nullptr && neighbor->isKeyframe())
+                current_group.keyframe_ids.insert(neighbor->getId());
+        }
+
+        int previous_consistency = 0;
+        for (const auto& previous_group : consistent_loop_groups_)
+        {
+            bool overlaps = false;
+            for (const std::size_t id : current_group.keyframe_ids)
+            {
+                if (previous_group.keyframe_ids.count(id) > 0)
+                {
+                    overlaps = true;
+                    break;
+                }
+            }
+            if (overlaps)
+                previous_consistency = std::max(previous_consistency,
+                                                previous_group.consistency + 1);
+        }
+
+        current_group.consistency = previous_consistency;
+        group.consistency = current_group.consistency;
+        current_consistent_groups.push_back(std::move(current_group));
+    }
+    consistent_loop_groups_ = std::move(current_consistent_groups);
+
     std::sort(ranked_groups.begin(), ranked_groups.end(),
                 [](const LoopCandidateGroup& a, const LoopCandidateGroup& b) 
                 {
@@ -512,6 +598,9 @@ std::vector<std::shared_ptr<Frame>> LoopCloser::detectLoopCandidates(
 
         if (group.group_score < min_keep_score)
             break;
+
+        if (group.consistency < 2)
+            continue;
 
         candidates.push_back(group.representative);
 
@@ -857,7 +946,10 @@ bool LoopCloser::isLoopSim3Accepted(const LoopSim3Result& sim3_result,
     if (!sim3_result.success)
         return false;
 
-    if (sim3_result.inlier_num < 12)
+    // ORB-SLAM2 logic reference: OptimizeSim3 accepts a loop only after at
+    // least 20 optimized inlier correspondences.  The previous 12-point
+    // gate allowed a small perceptual alias to deform the entire map.
+    if (sim3_result.inlier_num < 20)
         return false;
 
     if (correspondence_num == 0)

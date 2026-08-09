@@ -2,7 +2,6 @@
 #define MINI_ORB_SLAM_INCLUDE_ORB_EXTRACTOR_H_
 
 #include <vector>
-
 #include <opencv4/opencv2/features2d.hpp>
 #include <ros/ros.h>
 
@@ -15,7 +14,10 @@ public:
     ORBExtractor() = default;
 
     bool loadParams(ros::NodeHandle& nh);
-    void extract(const cv::Mat& img, std::vector<cv::KeyPoint>& keypoints, cv::Mat& descriptors) const;
+    // ORB-SLAM2 logic reference: monocular initialization uses a separate
+    // extractor configured with 2*nFeatures; normal tracking uses nFeatures.
+    void extract(const cv::Mat& img, std::vector<cv::KeyPoint>& keypoints,
+                 cv::Mat& descriptors, bool initialization = false) const;
 
     int getFeaturesNum() const { return features_num_; }
     int getLevelsNum() const { return levels_num_; }
@@ -29,6 +31,7 @@ private:
     int min_th_fast_{7};
 
     cv::Ptr<cv::ORB> orb_;
+    cv::Ptr<cv::ORB> initialization_orb_;
 };
 
 } // namespace mini_orb_slam

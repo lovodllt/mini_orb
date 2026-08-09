@@ -11,3 +11,7 @@ docs/
 
 # Local KITTI playback support.
 *[Kk][Ii][Tt][Tt][Ii]*
+
+# Keep the maintained KITTI test entry points visible to version control.
+!src/kitti_mono_publisher.cpp
+!launch/kitti_mono.launch

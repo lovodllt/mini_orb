@@ -33,6 +33,8 @@ public:
     void start();
     void requestFinish();
     void join();
+    void requestStop();
+    void release();
 
     bool insertKeyframe(const LocalMappingInput& inoput);
     bool hasPendingKeyframe() const;
@@ -82,18 +84,28 @@ private:
     std::vector<std::shared_ptr<Frame>> collectFusionKeyframes(
         const std::shared_ptr<Frame>& cur_keyframe) const;
 
+    struct FusionProjectionContext
+    {
+        std::shared_ptr<Camera> camera;
+        cv::Mat R_cw;
+        cv::Mat t_cw;
+        cv::Point3d camera_center;
+        cv::Size image_size;
+    };
+
     std::size_t searchInNeighbors(const std::shared_ptr<Map>& map,
                                   const std::shared_ptr<Frame>& cur_keyframe) const;
 
     bool projectionMapPointToFrame(const std::shared_ptr<MapPoint>& map_point,
-                                   const std::shared_ptr<Frame>& frame,
+                                   const FusionProjectionContext& context,
                                    cv::Point2f& projected_pixel,
-                                   double camera_distance,
+                                   double& camera_distance,
                                    int& pred_level) const;
 
     int findFuseMatchInKeyframe(const std::shared_ptr<MapPoint>& map_point,
-                                const std::shared_ptr<Frame>& keyframe,
-                                const cv::Point2f& projected_pixel,
+                                 const std::shared_ptr<Frame>& keyframe,
+                                 const cv::Mat& map_descriptor,
+                                 const cv::Point2f& projected_pixel,
                                 int pred_level,
                                 const std::unordered_set<int>& used_feature_indices) const;
 
@@ -115,6 +127,7 @@ private:
     {
         std::size_t total_map_features{0};
         std::size_t redundant_map_features{0};
+        std::size_t duplicate_keyframe_observations{0};
         double redundant_ratio{0.0};
     };
 
@@ -156,6 +169,9 @@ private:
     mutable std::list<std::shared_ptr<MapPoint>> recent_added_map_points_;
     mutable std::size_t local_mapping_generation_{0};
     mutable std::atomic_bool processing_new_keyframe_{false};
+    // g2o consumes a bool force-stop flag. It is set when a newer keyframe is
+    // queued during the opportunistic BA window.
+    mutable bool abort_ba_{false};
 };
 
 } // namespace mini_orb_slam

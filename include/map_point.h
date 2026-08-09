@@ -41,11 +41,11 @@ public:
 
     std::shared_ptr<Feature> selectRefFeatureCandidate() const;
 
-    void setRefFeature(const std::shared_ptr<Feature>& feature) { ref_feature_ = feature; }
-    void setCurFeature(const std::shared_ptr<Feature>& feature) { cur_feature_ = feature; }
+    void setRefFeature(const std::shared_ptr<Feature>& feature);
+    void setCurFeature(const std::shared_ptr<Feature>& feature);
 
-    std::shared_ptr<Feature> getRefFeature() const { return ref_feature_.lock(); }
-    std::shared_ptr<Feature> getCurFeature() const { return cur_feature_.lock(); }
+    std::shared_ptr<Feature> getRefFeature() const;
+    std::shared_ptr<Feature> getCurFeature() const;
 
     void setFirstKeyframeId(std::size_t keyframe_id) { first_keyframe_id_ = keyframe_id; }
     std::size_t getFirstKeyframeId() const { return first_keyframe_id_; }
@@ -61,29 +61,26 @@ public:
     bool isBad() const;
 
     void updateViewStatistics(double scale_factor, int levels_num);
-    bool hasValidViewStatistics() const { return has_view_statistics_; }
+    bool hasValidViewStatistics() const;
+    bool getViewStatistics(cv::Point3d& normal_vector,
+                           double& min_distance,
+                           double& max_distance) const;
 
-    void increaseVisibleTimes() { visible_times_++; }
-    void increaseFoundTimes() { found_times_++; }
+    void increaseVisibleTimes();
+    void increaseFoundTimes();
 
-    int getVisibleTimes() const { return visible_times_; }
-    int getFoundTimes() const { return found_times_; }
+    int getVisibleTimes() const;
+    int getFoundTimes() const;
 
-    double getFoundRatio() const
-    {
-        if (visible_times_ <= 0)
-            return 0.0;
-
-        return static_cast<double>(found_times_) / visible_times_;
-    }
+    double getFoundRatio() const;
 
     void updateRepresentativeDescriptor();
-    bool hasRepresentativeDescriptor() const { return !representative_descriptor_.empty(); };
-    const cv::Mat& getRepresentativeDescriptor() const { return representative_descriptor_; }
+    bool hasRepresentativeDescriptor() const;
+    cv::Mat getRepresentativeDescriptor() const;
 
-    const cv::Point3d& getNormalVector() const { return normal_vector_; }
-    double getMinDistance() const { return min_distance_; }
-    double getMaxDistance() const { return max_distance_; }
+    cv::Point3d getNormalVector() const;
+    double getMinDistance() const;
+    double getMaxDistance() const;
 
     int predictScaleLevel(double cur_distance, double scale_factor, int levels_num) const;
 
@@ -112,6 +109,7 @@ private:
 
     mutable std::mutex position_mutex_;
     mutable std::mutex observation_mutex_;
+    mutable std::mutex tracking_state_mutex_;
 };
 
 } // namespace mini_orb_slam

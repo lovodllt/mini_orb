@@ -45,6 +45,7 @@ void Map::addKeyframe(const std::shared_ptr<Frame>& keyframe)
 
     const std::shared_ptr<Frame> previous_keyframe = getLastKeyframe();
     keyframes_.push_back(keyframe);
+    markModified();
 
     if (previous_keyframe == nullptr)
         return;
@@ -153,12 +154,16 @@ bool Map::addPoseGraphConstraint(const std::shared_ptr<Frame>& from_keyframe,
             constraint.t_21 = stored_t;
             constraint.scale = scale;
 
+            markModified();
+
             return true;
         }
     }
 
     pose_graph_constraints_.push_back(
         PoseGraphConstraint{from_keyframe, to_keyframe, weight, stored_R, stored_t, scale, kind});
+
+    markModified();
 
     return true;
 }
@@ -186,6 +191,38 @@ bool Map::hasPoseGraphConstraint(const std::shared_ptr<Frame>& from_keyframe,
     }
 
     return false;
+}
+
+std::size_t Map::refreshPoseGraphMeasurements()
+{
+    std::size_t refreshed_num = 0;
+
+    for (auto& constraint : pose_graph_constraints_)
+    {
+        if (constraint.kind == PoseGraphConstraintKind::LOOP)
+            continue;
+
+        const std::shared_ptr<Frame> from_keyframe = constraint.from_keyframe.lock();
+        const std::shared_ptr<Frame> to_keyframe = constraint.to_keyframe.lock();
+        cv::Mat relative_R;
+        cv::Mat relative_t;
+        if (from_keyframe == nullptr || to_keyframe == nullptr ||
+            !computeRelativePoseConstraint(from_keyframe, to_keyframe,
+                                           relative_R, relative_t))
+        {
+            continue;
+        }
+
+        constraint.R_21 = relative_R;
+        constraint.t_21 = relative_t;
+        constraint.scale = 1.0;
+        refreshed_num++;
+    }
+
+    if (refreshed_num > 0)
+        markModified();
+
+    return refreshed_num;
 }
 
 } // namespace mini_orb_slam

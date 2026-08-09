@@ -21,9 +21,20 @@ public:
     bool loadParams(ros::NodeHandle& nh);
 
     int getMaxHammingDistance() const { return max_hamming_distance_; }
+    float getRatioThreshold() const { return ratio_threshold_; }
 
     std::vector<std::pair<int, int>> matchFrames(
         const Frame& ref_frame, const Frame& cur_frame) const;
+
+    // ORB-SLAM2 logic reference: monocular initialization keeps a predicted
+    // location for each reference feature and searches only level-zero
+    // candidates in a fixed image-space window.  This must remain separate
+    // from general descriptor matching used by tracking and triangulation.
+    std::vector<std::pair<int, int>> matchFramesForInitialization(
+        const Frame& ref_frame,
+        const Frame& cur_frame,
+        std::vector<cv::Point2f>& previous_matched,
+        int window_size = 100) const;
 
     std::vector<std::pair<int, int>> matchDescriptors(
         const cv::Mat& query_descriptors, const cv::Mat& train_descriptors) const;

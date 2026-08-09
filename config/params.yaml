@@ -12,7 +12,7 @@ min_relocalization_inliers: 50
 relocalization_guard_frames: 10
 
 orb_extractor:
-  features_num: 1000
+  features_num: 2000
   scale_factor: 1.2
   levels_num: 8
   init_th_fast: 20
@@ -20,7 +20,8 @@ orb_extractor:
 
 matcher:
   ratio_threshold: 0.8
-  max_hamming_distance: 50
+  # ORB-SLAM2 logic reference: ORBmatcher::TH_HIGH = 100.
+  max_hamming_distance: 100
 
 mini_orb_slam:
   min_initial_map_points: 100
@@ -31,6 +32,9 @@ mini_orb_slam:
   min_init_reference_features: 250
   min_init_reference_occupied_bins: 6
 
-min_keyframe_gap: 10
+# ORB-SLAM2 logic reference: monocular scheduling uses mMinFrames=0 and
+# mMaxFrames=Camera.fps (approximately 20 Hz for KITTI/EuRoC inputs).
+min_keyframe_gap: 0
+max_keyframe_gap: 20
 max_tracking_reproj_error: 8.0
 max_relocalization_candidates: 5

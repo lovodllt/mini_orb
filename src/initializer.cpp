@@ -775,8 +775,14 @@ TriangulationResult Initializer::triangulateFromMatchedFrames(
     if (camera_ == nullptr || ref_frame == nullptr || cur_frame == nullptr)
         return result;
 
-    if (ref_frame->getRcw().empty() || ref_frame->getTcw().empty() ||
-        cur_frame->getRcw().empty() || cur_frame->getTcw().empty())
+    cv::Mat R_ref;
+    cv::Mat t_ref;
+    cv::Mat R_cur;
+    cv::Mat t_cur;
+    ref_frame->copyPose(R_ref, t_ref);
+    cur_frame->copyPose(R_cur, t_cur);
+
+    if (R_ref.empty() || t_ref.empty() || R_cur.empty() || t_cur.empty())
     {
         return result;
     }
@@ -816,12 +822,6 @@ TriangulationResult Initializer::triangulateFromMatchedFrames(
     std::vector<cv::Point2f> ref_norm_points, cur_norm_points;
     cv::undistortPoints(ref_points, ref_norm_points, camera_->getK(), camera_->getD());
     cv::undistortPoints(cur_points, cur_norm_points, camera_->getK(), camera_->getD());
-
-    cv::Mat R_ref, t_ref, R_cur, t_cur;
-    ref_frame->getRcw().convertTo(R_ref, CV_64F);
-    ref_frame->getTcw().convertTo(t_ref, CV_64F);
-    cur_frame->getRcw().convertTo(R_cur, CV_64F);   
-    cur_frame->getTcw().convertTo(t_cur, CV_64F);
 
     const cv::Mat R_ref_wc = R_ref.t();
     const cv::Mat R_cur_wc = R_cur.t();

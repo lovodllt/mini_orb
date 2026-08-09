@@ -2,6 +2,7 @@
 #define MINI_ORB_SLAM_INCLUDE_COMMON_TYPES_H_
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <opencv4/opencv2/core.hpp>
@@ -150,6 +151,7 @@ struct LocalBAResult
 
     double seed_reproj_error{0.0};
     double candidate_seed_reproj_error{0.0};
+    std::string rejection_reason;
 };
 
 struct LocalMappingResult
@@ -165,11 +167,14 @@ struct LocalMappingResult
     bool local_ba_success{false};
     bool local_ba_rejected{false};
 
+    double local_ba_duration_ms{0.0};
+
     int local_ba_edge_num{0};
     int local_ba_rejected_edge_num{0};
 
     double local_ba_seed_reproj_error{0.0};
     double local_ba_candidate_seed_reproj_error{0.0};
+    std::string local_ba_rejection_reason;
 };
 
 struct LocalMappingInput

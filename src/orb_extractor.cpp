@@ -1,5 +1,7 @@
 #include "orb_extractor.h"
 
+#include <algorithm>
+
 namespace mini_orb_slam
 {
 
@@ -11,17 +13,23 @@ bool ORBExtractor::loadParams(ros::NodeHandle& nh)
     nh.param("init_th_fast", init_th_fast_, init_th_fast_);
     nh.param("min_th_fast", min_th_fast_, min_th_fast_);
 
-    orb_ = cv::ORB::create(features_num_,            // 保留特征点数
-                           scale_factor_,            // 图像金字塔缩放比例
-                           levels_num_,              // 图像金字塔总层数
-                           31,                       // 边界宽度
-                           0,                        // 金字塔开始层数（原图）
-                           2,                        // 计算描述子时比较的点数
-                           cv::ORB::HARRIS_SCORE, 
-                           31,                       // 计算描述子的邻域窗口宽度
-                           init_th_fast_);           // FAST 角点初始阈值
+    const auto create_orb = [this](int feature_count)
+    {
+        return cv::ORB::create(feature_count,
+                               scale_factor_,
+                               levels_num_,
+                               31,
+                               0,
+                               2,
+                               cv::ORB::HARRIS_SCORE,
+                               31,
+                               init_th_fast_);
+    };
 
-    if (orb_ == nullptr)
+    orb_ = create_orb(features_num_);
+    initialization_orb_ = create_orb(std::max(1, 2 * features_num_));
+
+    if (orb_ == nullptr || initialization_orb_ == nullptr)
     {
         ROS_ERROR("Failed to create ORB feature extractor.");
         return false;
@@ -33,7 +41,8 @@ bool ORBExtractor::loadParams(ros::NodeHandle& nh)
     return true;
 }
 
-void ORBExtractor::extract(const cv::Mat& img, std::vector<cv::KeyPoint>& keypoints, cv::Mat& descriptors) const
+void ORBExtractor::extract(const cv::Mat& img, std::vector<cv::KeyPoint>& keypoints,
+                           cv::Mat& descriptors, bool initialization) const
 {
     keypoints.clear();
     descriptors.release();
@@ -44,13 +53,14 @@ void ORBExtractor::extract(const cv::Mat& img, std::vector<cv::KeyPoint>& keypoi
         return;
     }
 
-    if (orb_ == nullptr)
+    const cv::Ptr<cv::ORB>& extractor = initialization ? initialization_orb_ : orb_;
+    if (extractor == nullptr)
     {
         ROS_ERROR("ORB extractor is not initialized. Call loadParams() first.");
         return;
     }
 
-    orb_->detectAndCompute(img, cv::noArray(), keypoints, descriptors);
+    extractor->detectAndCompute(img, cv::noArray(), keypoints, descriptors);
 }
 
 } // namespace mini_orb_slam

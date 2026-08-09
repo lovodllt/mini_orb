@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(mini_orb_slam)
 
+# Keep the runtime default comparable to the optimized ORB2 build. Without an
+# explicit build type catkin leaves CMAKE_CXX_FLAGS_RELEASE unused, producing
+# an unoptimized binary and distorting frontend/BA throughput measurements.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -50,6 +57,7 @@ add_executable(mini_orb_node
   src/loop_closer.cpp
 )
 
+
 target_link_libraries(mini_orb_node
   ${catkin_LIBRARIES}
   ${OpenCV_LIBS}
@@ -60,4 +68,24 @@ target_link_libraries(mini_orb_node
   g2o::types_sba
   g2o::types_sim3
   g2o::solver_eigen
+)
+
+add_executable(kitti_mono_publisher
+  src/kitti_mono_publisher.cpp
+)
+
+target_link_libraries(kitti_mono_publisher
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBS}
+)
+
+add_executable(camera_distortion_params_check
+  test/camera_distortion_params_test.cpp
+  src/camera.cpp
+)
+
+target_link_libraries(camera_distortion_params_check
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBS}
+  Eigen3::Eigen
 )

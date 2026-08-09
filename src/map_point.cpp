@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <unordered_set>
 
 #include "map_point.h"
 #include "feature.h"
@@ -108,6 +109,30 @@ cv::Point3d MapPoint::getPos() const
     return pos_;
 }
 
+void MapPoint::setRefFeature(const std::shared_ptr<Feature>& feature)
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    ref_feature_ = feature;
+}
+
+void MapPoint::setCurFeature(const std::shared_ptr<Feature>& feature)
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    cur_feature_ = feature;
+}
+
+std::shared_ptr<Feature> MapPoint::getRefFeature() const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    return ref_feature_.lock();
+}
+
+std::shared_ptr<Feature> MapPoint::getCurFeature() const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    return cur_feature_.lock();
+}
+
 void MapPoint::addObservation(const std::shared_ptr<Feature>& feature)
 {
     if (feature == nullptr)
@@ -126,6 +151,17 @@ void MapPoint::addObservation(const std::shared_ptr<Feature>& feature)
 
         if (obs == feature)
             return;
+
+        // ORB-SLAM2 logic reference: observations are keyed by KeyFrame, so a
+        // MapPoint can have at most one feature observation in a keyframe.
+        const std::shared_ptr<Frame> obs_frame = obs->getFrame();
+        const std::shared_ptr<Frame> feature_frame = feature->getFrame();
+        if (obs_frame != nullptr && feature_frame != nullptr &&
+            obs_frame == feature_frame)
+        {
+            feature->setMapPoint(nullptr);
+            return;
+        }
 
         it++;
     }
@@ -231,8 +267,17 @@ void MapPoint::setBad(bool is_bad)
         }
 
         observations_.clear();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(tracking_state_mutex_);
         ref_feature_.reset();
         cur_feature_.reset();
+        representative_descriptor_.release();
+        has_view_statistics_ = false;
+        normal_vector_ = cv::Point3d(0.0, 0.0, 1.0);
+        min_distance_ = 0.0;
+        max_distance_ = 0.0;
     }
 
     for (const auto& feature : observations)
@@ -254,22 +299,28 @@ bool MapPoint::isBad() const
 std::vector<std::shared_ptr<Feature>> MapPoint::getObservations() const
 {
     std::vector<std::shared_ptr<Feature>> observations;
-
-    std::lock_guard<std::mutex> lock(observation_mutex_);
-
-    observations.reserve(observations_.size());
-
-    for (const auto& obs : observations_)
     {
-        const std::shared_ptr<Feature> feature = obs.lock();
-        if (feature == nullptr)
-            continue;
-
-        if (feature->getMapPoint().get() != this)
-            continue;
-
-        observations.push_back(feature);
+        std::lock_guard<std::mutex> lock(observation_mutex_);
+        observations.reserve(observations_.size());
+        for (const auto& obs : observations_)
+        {
+            const std::shared_ptr<Feature> feature = obs.lock();
+            if (feature != nullptr)
+                observations.push_back(feature);
+        }
     }
+
+    // Validate reverse links after releasing observation_mutex_. This avoids
+    // the Feature -> MapPoint and MapPoint -> Feature lock-order inversion
+    // during concurrent fusion/BA maintenance.
+    observations.erase(
+        std::remove_if(observations.begin(), observations.end(),
+                       [this](const std::shared_ptr<Feature>& feature)
+                       {
+                           return feature == nullptr ||
+                                  feature->getMapPoint().get() != this;
+                       }),
+        observations.end());
     
     return observations;
 }
@@ -279,28 +330,34 @@ std::vector<std::shared_ptr<Feature>> MapPoint::getKeyframeObservations(
 {
     std::vector<std::shared_ptr<Feature>> keyframe_observations;
 
-    std::lock_guard<std::mutex> lock(observation_mutex_);
-
-    keyframe_observations.reserve(observations_.size());
-
-    for (const auto& obs : observations_)
     {
-        const std::shared_ptr<Feature> feature = obs.lock();
-        if (feature == nullptr)
-            continue;
-
-        if (feature->getMapPoint().get() != this)
-            continue;
-
-        const std::shared_ptr<Frame> frame = feature->getFrame();
-        if (frame == nullptr || !frame->isKeyframe())
-            continue;
-
-        if (exclude_frame != nullptr && frame == exclude_frame)
-            continue;
-
-        keyframe_observations.push_back(feature);
+        std::lock_guard<std::mutex> lock(observation_mutex_);
+        keyframe_observations.reserve(observations_.size());
+        for (const auto& obs : observations_)
+        {
+            const std::shared_ptr<Feature> feature = obs.lock();
+            if (feature != nullptr)
+                keyframe_observations.push_back(feature);
+        }
     }
+
+    std::unordered_set<std::size_t> observed_keyframe_ids;
+    observed_keyframe_ids.reserve(keyframe_observations.size());
+    keyframe_observations.erase(
+        std::remove_if(keyframe_observations.begin(), keyframe_observations.end(),
+                       [this, &exclude_frame, &observed_keyframe_ids]
+                       (const std::shared_ptr<Feature>& feature)
+                       {
+                           if (feature == nullptr ||
+                               feature->getMapPoint().get() != this)
+                               return true;
+                           const std::shared_ptr<Frame> frame = feature->getFrame();
+                           if (frame == nullptr || !frame->isKeyframe() ||
+                               (exclude_frame != nullptr && frame == exclude_frame))
+                               return true;
+                           return !observed_keyframe_ids.insert(frame->getId()).second;
+                       }),
+        keyframe_observations.end());
 
     return keyframe_observations;
 }
@@ -324,11 +381,6 @@ std::shared_ptr<Feature> MapPoint::selectRefFeatureCandidate() const
 
 void MapPoint::updateViewStatistics(double scale_factor, int level_num)
 {
-    has_view_statistics_ = false;
-    normal_vector_ = cv::Point3d(0.0, 0.0, 1.0);
-    min_distance_ = 0.0;
-    max_distance_ = 0.0;
-
     if (scale_factor <= 1.0 || level_num <= 0)
         return;
 
@@ -343,20 +395,20 @@ void MapPoint::updateViewStatistics(double scale_factor, int level_num)
     if (ref_feature == nullptr)
         return;
 
-    setRefFeature(ref_feature);
-
     const std::shared_ptr<Frame> ref_frame = ref_feature->getFrame();
     if (ref_frame == nullptr)
         return;
 
-    const cv::Point3d& ref_view = pos_ - ref_frame->getCameraCenter();
+    const cv::Point3d pos = getPos();
+    const cv::Point3d ref_view = pos - ref_frame->getCameraCenter();
     const double ref_distance = pointNorm(ref_view);
     if (ref_distance <= 1e-6)
         return;
 
     const int ref_level = std::max(ref_feature->getLevel(), 0);
-    max_distance_ = ref_distance * std::pow(scale_factor, ref_level);
-    min_distance_ = max_distance_ / std::pow(scale_factor, std::max(level_num - 1, 0));
+    const double max_distance = ref_distance * std::pow(scale_factor, ref_level);
+    const double min_distance =
+        max_distance / std::pow(scale_factor, std::max(level_num - 1, 0));
 
     cv::Point3d normal_sum(0.0, 0.0, 0.0);
     int valid_obs_num = 0;
@@ -370,7 +422,7 @@ void MapPoint::updateViewStatistics(double scale_factor, int level_num)
         if (frame == nullptr)
             continue;
 
-        const cv::Point3d& view = pos_ - frame->getCameraCenter();
+        const cv::Point3d view = pos - frame->getCameraCenter();
         const double distance = pointNorm(view);
         if (distance <= 1e-6)
             continue;
@@ -384,16 +436,21 @@ void MapPoint::updateViewStatistics(double scale_factor, int level_num)
     if (valid_obs_num <= 0)
         return;
 
-    normal_vector_ = normalizePoint(normal_sum);
-    has_view_statistics_ = (pointNorm(normal_vector_) > 1e-6) &&
-                           (min_distance_ > 0.0) &&
-                           (max_distance_ >= min_distance_);
+    const cv::Point3d normal_vector = normalizePoint(normal_sum);
+    const bool has_view_statistics = (pointNorm(normal_vector) > 1e-6) &&
+                                     (min_distance > 0.0) &&
+                                     (max_distance >= min_distance);
+
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    ref_feature_ = ref_feature;
+    normal_vector_ = normal_vector;
+    min_distance_ = min_distance;
+    max_distance_ = max_distance;
+    has_view_statistics_ = has_view_statistics;
 }
 
 void MapPoint::updateRepresentativeDescriptor()
 {
-    representative_descriptor_.release();
-
     std::vector<std::shared_ptr<Feature>> observations = getKeyframeObservations();
     if (observations.empty())
         observations = getObservations();
@@ -418,6 +475,7 @@ void MapPoint::updateRepresentativeDescriptor()
 
     if (descriptors.size() == 1)
     {
+        std::lock_guard<std::mutex> lock(tracking_state_mutex_);
         representative_descriptor_ = descriptors.front().clone();
         return;
     }
@@ -455,11 +513,96 @@ void MapPoint::updateRepresentativeDescriptor()
     }
 
     if (best_idx >= 0)
-        representative_descriptor_ = descriptors[best_idx].clone();
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    representative_descriptor_ = descriptors[best_idx].clone();
+}
+
+bool MapPoint::hasValidViewStatistics() const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    return has_view_statistics_;
+}
+
+bool MapPoint::getViewStatistics(cv::Point3d& normal_vector,
+                                 double& min_distance,
+                                 double& max_distance) const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    if (!has_view_statistics_)
+        return false;
+
+    normal_vector = normal_vector_;
+    min_distance = min_distance_;
+    max_distance = max_distance_;
+    return true;
+}
+
+void MapPoint::increaseVisibleTimes()
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    visible_times_++;
+}
+
+void MapPoint::increaseFoundTimes()
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    found_times_++;
+}
+
+int MapPoint::getVisibleTimes() const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    return visible_times_;
+}
+
+int MapPoint::getFoundTimes() const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    return found_times_;
+}
+
+double MapPoint::getFoundRatio() const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    if (visible_times_ <= 0)
+        return 0.0;
+
+    return static_cast<double>(found_times_) / visible_times_;
+}
+
+bool MapPoint::hasRepresentativeDescriptor() const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    return !representative_descriptor_.empty();
+}
+
+cv::Mat MapPoint::getRepresentativeDescriptor() const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    return representative_descriptor_.clone();
+}
+
+cv::Point3d MapPoint::getNormalVector() const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    return normal_vector_;
+}
+
+double MapPoint::getMinDistance() const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    return min_distance_;
+}
+
+double MapPoint::getMaxDistance() const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    return max_distance_;
 }
 
 int MapPoint::predictScaleLevel(double current_distance, double scale_factor, int levels_num) const
 {
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
     if (!has_view_statistics_ || current_distance <= 1e-6 ||
         scale_factor <= 1.0 || levels_num <= 0)
     {

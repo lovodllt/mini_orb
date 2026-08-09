@@ -38,6 +38,9 @@ public:
     PnPResult trackFrameByMotionModel(const std::shared_ptr<Frame>& last_frame,
                                       const std::shared_ptr<Frame>& cur_frame) const;
 
+    PnPResult trackFrameByReferenceFrame(const std::shared_ptr<Frame>& reference_frame,
+                                         const std::shared_ptr<Frame>& cur_frame) const;
+
     PnPResult refinePoseWithLocalMap(
         const PnPResult& motion_pnp_result,
         const std::vector<std::shared_ptr<MapPoint>>& local_map_points,
@@ -56,6 +59,27 @@ public:
                                        const PnPResult& pnp_result) const;
 
 private:
+    // P2-EUROC-DEBUG-R19: records why a projected point did not yield a
+    // feature match. It is diagnostics-only and never participates in matching.
+    struct ProjectionFeatureSearchResult
+    {
+        int feature_idx{-1};
+        bool has_spatial_candidates{false};
+        bool has_available_descriptor{false};
+        bool hamming_rejected{false};
+        bool ratio_rejected{false};
+    };
+
+    struct ProjectionPose
+    {
+        cv::Mat R_cw;
+        cv::Mat t_cw;
+        cv::Point3d camera_center{0.0, 0.0, 0.0};
+        int image_width{0};
+        int image_height{0};
+        bool valid{false};
+    };
+
     std::shared_ptr<Feature> selectRefFeature(const std::shared_ptr<MapPoint>& map_point) const;
     bool getFeatureDescriptor(const std::shared_ptr<Feature>& feature, cv::Mat& descriptor) const;
     bool getMapPointDescriptor(const std::shared_ptr<MapPoint>& map_point, cv::Mat& descriptor) const;
@@ -65,22 +89,27 @@ private:
     bool isProjectionMatchReliable(int best_distance,
                                    int second_best_distance,
                                    int best_level,
-                                   int second_best_level) const;
+                                   int second_best_level,
+                                   bool apply_ratio_test) const;
 
     float computeSearchRadius(int predicted_level) const;
 
+    ProjectionPose snapshotProjectionPose(const std::shared_ptr<Frame>& frame) const;
+
     bool projectMapPointToFrame(const std::shared_ptr<MapPoint>& map_point, 
-                                const std::shared_ptr<Frame>& frame, 
+                                const ProjectionPose& pose,
                                 cv::Point2f& projected_pixel,
                                 double& depth,
                                 double& camera_distance) const;
 
-    int findBestFeatureInArea(const std::shared_ptr<Frame>& frame, 
-                              const cv::Point2f& projected_pixel,
-                              int predicted_level,
-                              const cv::Mat& map_descriptor,
-                              const std::unordered_set<int>& used_feature_indices,
-                              float search_radius) const;
+    ProjectionFeatureSearchResult findBestFeatureInArea(
+        const std::shared_ptr<Frame>& frame,
+        const cv::Point2f& projected_pixel,
+        int predicted_level,
+        const cv::Mat& map_descriptor,
+        const std::unordered_set<int>& used_feature_indices,
+        float search_radius,
+        bool apply_ratio_test) const;
 
     PnPResult trackFrameByDescriptorMapPoints(const std::vector<std::shared_ptr<MapPoint>>& map_points,
                                               const std::shared_ptr<Frame>& cur_frame) const;
@@ -99,6 +128,8 @@ private:
         const std::shared_ptr<Frame>& cur_frame,
         float radius_scale,
         bool update_statistics,
+        bool apply_ratio_test,
+        bool apply_view_gate,
         std::unordered_set<std::size_t>& used_map_point_ids,
         std::unordered_set<int>& used_feature_indices,
         PnPResult& result,
@@ -109,6 +140,8 @@ private:
         const std::shared_ptr<Frame>& cur_frame,
         float radius_scale,
         bool update_statistics,
+        bool apply_ratio_test,
+        bool apply_view_gate,
         std::vector<std::shared_ptr<MapPoint>>* visible_map_points = nullptr) const;
 
     std::shared_ptr<Camera> camera_;

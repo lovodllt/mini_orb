@@ -17,8 +17,10 @@
 #include "matcher.h"
 #include "pose_optimizer.h"
 
-namespace mini_orb_slam 
+namespace mini_orb_slam
 {
+
+class LocalMapper;
 
 struct LoopCandidateGroup
 {
@@ -26,6 +28,7 @@ struct LoopCandidateGroup
     double bow_score{0.0};
     double group_score{0.0};
     int support_num{0};
+    int consistency{0};
 };
 
 struct LoopSim3Correspondence
@@ -103,6 +106,7 @@ public:
     LoopCloser(const std::shared_ptr<KeyframeDatabase>& keyframe_database,
                const Matcher& matcher,
                const std::shared_ptr<PoseOptimizer>& pose_optimizer,
+               LocalMapper* local_mapper,
                double scale_factor,
                int levels_num);
 
@@ -133,6 +137,12 @@ public:
         const LoopVerificationResult& loop_result) const;
 
 private:
+    struct ConsistentLoopGroup
+    {
+        std::unordered_set<std::size_t> keyframe_ids;
+        int consistency{0};
+    };
+
     void run();
 
     std::unordered_set<std::size_t> collectConnectedKeyframeIds(
@@ -198,6 +208,7 @@ private:
     std::shared_ptr<KeyframeDatabase> keyframe_database_;
     const Matcher& matcher_;
     std::shared_ptr<PoseOptimizer> pose_optimizer_;
+    LocalMapper* local_mapper_{nullptr};
 
     mutable std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
@@ -211,6 +222,10 @@ private:
     mutable bool finish_requested_{false};
     mutable bool finished_{false};
     mutable bool worker_started_{false};
+
+    // ORB-SLAM2 logic reference: a loop candidate must recur in a
+    // covisibility group over consecutive loop checks before verification.
+    mutable std::vector<ConsistentLoopGroup> consistent_loop_groups_;
 };
 
 } // namespace mini_orb_slam

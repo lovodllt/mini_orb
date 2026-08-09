@@ -4,6 +4,8 @@
 #include <memory>
 #include <vector>
 #include <cmath>
+#include <atomic>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <opencv4/opencv2/core.hpp>
@@ -30,6 +32,10 @@ public:
 
     PnPResult optimize(const PnPResult& input_result) const;
 
+    // ORB-SLAM2 logic reference: TrackLocalMap refines the pose supplied by
+    // the seed tracker directly against all local-map observations.
+    PnPResult optimizeWithPosePrior(const PnPResult& input_result) const;
+
     InitialMapOptimizationResult optimizeInitialMap(
         const std::shared_ptr<Map>& map,
         const std::shared_ptr<Frame>& ref_frame,
@@ -37,7 +43,8 @@ public:
 
     LocalBAResult optimizeLocalMap(const std::shared_ptr<Map>& map, 
                                    const std::shared_ptr<Frame>& cur_keyframe,
-                                   const PnPResult& tracking_seed) const;
+                                   const PnPResult& tracking_seed,
+                                   bool* abort_flag = nullptr) const;
 
     bool optimizeEssentialGraph(const std::vector<std::shared_ptr<Frame>>& map_keyframes,
                                 const std::vector<std::shared_ptr<MapPoint>>& map_points,
@@ -45,6 +52,9 @@ public:
                                 const std::shared_ptr<Frame>& anchor_keyframe) const;
 
 private:
+    PnPResult optimizeImpl(const PnPResult& input_result,
+                            bool run_pnp_ransac) const;
+
     struct LocalBAObservation
     {
         std::shared_ptr<Frame> keyframe;
@@ -56,10 +66,20 @@ private:
 
     struct LocalBAContext
     {
+        struct PoseSnapshot
+        {
+            cv::Mat R_cw;
+            cv::Mat t_cw;
+        };
+
         std::vector<std::shared_ptr<Frame>> local_keyframes;
         std::vector<std::shared_ptr<Frame>> fixed_keyframes;
         std::vector<std::shared_ptr<MapPoint>> local_map_points;
         std::vector<LocalBAObservation> observations;
+        std::shared_ptr<Frame> map_origin_keyframe;
+        std::unordered_map<std::size_t, PoseSnapshot> keyframe_poses;
+        std::unordered_map<std::size_t, cv::Point3d> map_point_positions;
+        std::size_t map_version{0};
     };
 
     bool projectWorldPointToFrame(const std::shared_ptr<Frame>& frame,
@@ -86,6 +106,8 @@ private:
     bool validateLocalBACandidate(const PnPResult& tracking_seed, 
                                   const cv::Mat& candidate_R_cw,
                                   const cv::Mat& candidate_t_cw,
+                                  const std::unordered_map<std::size_t, cv::Point3d>&
+                                      candidate_map_point_positions,
                                   double& seed_reproj_error,
                                   double& candidate_seed_reproj_error) const;
 
@@ -116,7 +138,10 @@ private:
         const std::vector<LocalBAObservation>& observations,
         const std::shared_ptr<MapPoint>& map_point) const;
 
-    LocalBAContext buildLocalBAContext(const std::shared_ptr<Frame>& cur_frame) const;
+    // Caller holds Map::getMutex(). All geometry used by the solver is copied
+    // here, so g2o never reads mutable map state after the lock is released.
+    LocalBAContext buildLocalBAContext(const std::shared_ptr<Map>& map,
+                                       const std::shared_ptr<Frame>& cur_frame) const;
 
     cv::Matx23d computeProjectionJacobian(const cv::Point3d& point_camera) const;
     cv::Matx33d skewSymmetric(const cv::Point3d& p) const;

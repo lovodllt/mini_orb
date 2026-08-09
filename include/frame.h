@@ -2,6 +2,7 @@
 #define MINI_ORB_SLAM_INCLUDE_FRAME_H_
 
 #include <cstddef>
+#include <atomic>
 #include <memory>
 #include <vector>
 #include <mutex>
@@ -27,13 +28,14 @@ public:
 
     void setPose(const cv::Mat& R_cw, const cv::Mat& t_cw);
     void copyPose(cv::Mat& R_cw, cv::Mat& t_cw) const;
-    const cv::Mat& getRcw() const { return R_cw_; }
-    const cv::Mat& getTcw() const { return t_cw_; }
     cv::Mat getRwc() const;
     cv::Point3d getCameraCenter() const;
 
-    bool isKeyframe() const { return is_keyframe_; }
-    void setKeyframe(bool is_keyframe) { is_keyframe_ = is_keyframe; }
+    bool isKeyframe() const { return is_keyframe_.load(std::memory_order_acquire); }
+    void setKeyframe(bool is_keyframe)
+    {
+        is_keyframe_.store(is_keyframe, std::memory_order_release);
+    }
 
     std::size_t getId() const { return id_; }
     double getTimestamp() const { return timestamp_; }
@@ -110,7 +112,7 @@ private:
 
     cv::Mat R_cw_;
     cv::Mat t_cw_;
-    bool is_keyframe_{false};
+    std::atomic<bool> is_keyframe_{false};
 
     BowVector bow_vector_;
     FeatureVector feature_vector_;

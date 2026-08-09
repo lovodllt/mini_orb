@@ -4,6 +4,7 @@
 
 #include <g2o/core/robust_kernel_impl.h>
 #include <g2o/types/sba/edge_project_xyz.h>
+#include <g2o/types/sba/edge_project_xyz_onlypose.h>
 #include <g2o/types/sba/vertex_se3_expmap.h>
 #include <g2o/types/slam3d/vertex_pointxyz.h>
 
@@ -269,7 +270,7 @@ double PoseOptimizer::computeMeanReprojectionError(const std::vector<cv::Point3d
                       rvec,
                       tvec,
                       camera_->getK(),
-                      camera_->getD(),
+                      cv::Mat(),
                       projected_points);
 
     if (projected_points.size() != img_points.size())
@@ -318,7 +319,7 @@ double PoseOptimizer::computeMeanPointReprojectionError(
                             rvec,
                             t_cw,
                             camera_->getK(),
-                            camera_->getD(),
+                            cv::Mat(),
                             projected_points);
 
         if (projected_points.size() != 1)
@@ -485,6 +486,8 @@ double PoseOptimizer::computeTotalBAReprojectionError(
 bool PoseOptimizer::validateLocalBACandidate(const PnPResult& tracking_seed, 
                                              const cv::Mat& candidate_R_cw,
                                              const cv::Mat& candidate_t_cw,
+                                             const std::unordered_map<std::size_t, cv::Point3d>&
+                                                 candidate_map_point_positions,
                                              double& seed_reproj_error,
                                              double& candidate_seed_reproj_error) const
 {
@@ -494,6 +497,7 @@ bool PoseOptimizer::validateLocalBACandidate(const PnPResult& tracking_seed,
     if (camera_ == nullptr || !tracking_seed.success ||
         tracking_seed.inlier_indices.empty() ||
         tracking_seed.object_points.size() != tracking_seed.img_points.size() ||
+        tracking_seed.object_points.size() != tracking_seed.candidate_map_points.size() ||
         candidate_R_cw.rows != 3 || candidate_R_cw.cols != 3 ||
         candidate_t_cw.rows != 3 || candidate_t_cw.cols != 1)
     {
@@ -501,8 +505,10 @@ bool PoseOptimizer::validateLocalBACandidate(const PnPResult& tracking_seed,
     }
 
     std::vector<cv::Point3d> seed_object_points;
+    std::vector<cv::Point3d> candidate_object_points;
     std::vector<cv::Point2f> seed_img_points;
     seed_object_points.reserve(tracking_seed.inlier_indices.rows);
+    candidate_object_points.reserve(tracking_seed.inlier_indices.rows);
     seed_img_points.reserve(tracking_seed.inlier_indices.rows);
 
     for (int i = 0; i < tracking_seed.inlier_indices.rows; i++)
@@ -511,12 +517,21 @@ bool PoseOptimizer::validateLocalBACandidate(const PnPResult& tracking_seed,
         if (index < 0 || index >= tracking_seed.object_points.size())
             continue;
 
+        const std::shared_ptr<MapPoint>& map_point = tracking_seed.candidate_map_points[index];
+        if (map_point == nullptr)
+            continue;
+
+        const auto candidate_point_it = candidate_map_point_positions.find(map_point->getId());
         seed_object_points.push_back(tracking_seed.object_points[index]);
+        candidate_object_points.push_back(candidate_point_it == candidate_map_point_positions.end()
+            ? tracking_seed.object_points[index]
+            : candidate_point_it->second);
         seed_img_points.push_back(tracking_seed.img_points[index]);
     }
 
     constexpr std::size_t kMinValidationInliers = 20;
     if (seed_object_points.size() < kMinValidationInliers ||
+        candidate_object_points.size() != seed_object_points.size() ||
         tracking_seed.R.rows != 3 || tracking_seed.R.cols != 3 ||
         tracking_seed.tvec.rows != 3 || tracking_seed.tvec.cols != 1)
     {
@@ -543,7 +558,7 @@ bool PoseOptimizer::validateLocalBACandidate(const PnPResult& tracking_seed,
         return false;
     }
 
-    for (const auto& point : seed_object_points)
+    for (const auto& point : candidate_object_points)
     {
         const cv::Mat point_world = 
             (cv::Mat_<double>(3, 1) << point.x, point.y, point.z);
@@ -558,7 +573,7 @@ bool PoseOptimizer::validateLocalBACandidate(const PnPResult& tracking_seed,
                                                      tracking_seed.rvec,
                                                      tracking_seed.tvec);
 
-    candidate_seed_reproj_error = computeMeanReprojectionError(seed_object_points,
+    candidate_seed_reproj_error = computeMeanReprojectionError(candidate_object_points,
                                                                seed_img_points,
                                                                candidate_rvec,
                                                                candidate_t);
@@ -569,6 +584,8 @@ bool PoseOptimizer::validateLocalBACandidate(const PnPResult& tracking_seed,
         return false;
     }
 
+    // Current-project reprojection must be evaluated against the candidate
+    // point estimates from the same BA transaction, not the pre-BA map.
     constexpr double kMaxSeedErrorIncreasePx = 0.25;
     constexpr double kMaxSeedErrorIncreaseRatio = 1.10;
 
@@ -581,6 +598,17 @@ bool PoseOptimizer::validateLocalBACandidate(const PnPResult& tracking_seed,
 }
 
 PnPResult PoseOptimizer::optimize(const PnPResult& input_result) const
+{
+    return optimizeImpl(input_result, true);
+}
+
+PnPResult PoseOptimizer::optimizeWithPosePrior(const PnPResult& input_result) const
+{
+    return optimizeImpl(input_result, false);
+}
+
+PnPResult PoseOptimizer::optimizeImpl(const PnPResult& input_result,
+                                      bool run_pnp_ransac) const
 {
     PnPResult result = input_result;
 
@@ -603,145 +631,202 @@ PnPResult PoseOptimizer::optimize(const PnPResult& input_result) const
         return vec.rows == 3 && vec.cols == 1;
     };
 
-    const bool has_inital_pose = 
+    const bool has_inital_pose =
         normalizePoseVector(result.rvec) && normalizePoseVector(result.tvec);
 
-    const int ransac_method = has_inital_pose ? cv::SOLVEPNP_ITERATIVE : cv::SOLVEPNP_EPNP;
-
-    bool success = false;
-    try
+    if (run_pnp_ransac)
     {
-        success = cv::solvePnPRansac(
-                      result.object_points,
-                      result.img_points,
-                      camera_->getK(),
-                      camera_->getD(),
-                      result.rvec,
-                      result.tvec,
-                      has_inital_pose,
-                      100,
-                      8.0,
-                      0.99,
-                      result.inlier_indices,
-                      ransac_method);
-    }
-    catch (const cv::Exception&)
-    {
-        return {};
-    }
-
-    if (!success || result.inlier_indices.rows < 6)
-        return {};
-
-    std::vector<cv::Point3d> inlier_object_points;
-    std::vector<cv::Point2f> inlier_img_points;
-    inlier_object_points.reserve(result.inlier_indices.rows);
-    inlier_img_points.reserve(result.inlier_indices.rows);
-
-    for (int i = 0; i < result.inlier_indices.rows; i++)
-    {
-        const int idx = result.inlier_indices.at<int>(i, 0);
-        if (idx < 0 || idx >= static_cast<int>(result.object_points.size()))
-            continue;
-
-        inlier_object_points.push_back(result.object_points[idx]);
-        inlier_img_points.push_back(result.img_points[idx]);
-    }
-
-    if (inlier_object_points.size() < 6)
-        return {};
-
-    result.inlier_num = static_cast<int>(inlier_object_points.size());
-    result.ransac_reproj_error = computeMeanReprojectionError(inlier_object_points, 
-                                                              inlier_img_points, 
-                                                              result.rvec, 
-                                                              result.tvec);
-
-    cv::Mat refined_rvec = result.rvec.clone();
-    cv::Mat refined_tvec = result.tvec.clone();
-
-    bool refine_success = false;
-    try
-    {
-        refine_success = cv::solvePnP(
-                             inlier_object_points,
-                             inlier_img_points,
-                             camera_->getK(),
-                             camera_->getD(),
-                             refined_rvec,
-                             refined_tvec,
-                             true,
-                             cv::SOLVEPNP_ITERATIVE);
-    }
-    catch (const cv::Exception&)
-    {
-        refine_success = false;
-    }
-
-    if (refine_success)
-    {
-        const double refined_error = computeMeanReprojectionError(inlier_object_points, 
-                                                                  inlier_img_points, 
-                                                                  refined_rvec, 
-                                                                  refined_tvec);
-
-        if (result.ransac_reproj_error <= 0.0 ||
-            refined_error <= result.ransac_reproj_error + 1e-6)
+        // OpenCV is used only to obtain a robust initial pose. The accepted
+        // pose and inlier set come from the four-round g2o refinement below.
+        const int ransac_method = has_inital_pose ? cv::SOLVEPNP_ITERATIVE
+                                                   : cv::SOLVEPNP_EPNP;
+        bool success = false;
+        try
         {
-            result.rvec = refined_rvec;
-            result.tvec = refined_tvec;
-            result.optimized = true;
-            result.optimized_reproj_error = refined_error;
+            success = cv::solvePnPRansac(
+                          result.object_points,
+                          result.img_points,
+                          camera_->getK(),
+                          cv::Mat(),
+                          result.rvec,
+                          result.tvec,
+                          has_inital_pose,
+                          100,
+                          8.0,
+                          0.99,
+                          result.inlier_indices,
+                          ransac_method);
         }
-        else
+        catch (const cv::Exception&)
         {
-            result.optimized = false;
-            result.optimized_reproj_error = result.ransac_reproj_error;
+            return {};
         }
+
+        if (!success || result.inlier_indices.rows < 6)
+            return {};
     }
-    else
+    else if (!has_inital_pose)
     {
-        result.optimized = false;
-        result.optimized_reproj_error = result.ransac_reproj_error;
+        return {};
     }
 
-    cv::Rodrigues(result.rvec, result.R);
-
-    int valid_inlier_num = 0;
-    int positive_depth_num = 0;
-
-    for (int i = 0; i < result.inlier_indices.rows; i++)
+    cv::Mat initial_R;
+    cv::Rodrigues(result.rvec, initial_R);
+    Eigen::Matrix3d initial_R_eigen;
+    Eigen::Vector3d initial_t_eigen;
+    if (!cvToEigenRotation(initial_R, initial_R_eigen) ||
+        !cvToEigenTranslation(result.tvec, initial_t_eigen))
     {
-        const int idx = result.inlier_indices.at<int>(i, 0);
-        if (idx < 0 || idx >= result.object_points.size())
-            continue;
+        return {};
+    }
 
-        const cv::Point3d& point = result.object_points[idx];
+    using BlockSolverType = g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>>;
+    using LinearSolverType = g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType>;
+    auto linear_solver = std::make_unique<LinearSolverType>();
+    auto block_solver = std::make_unique<BlockSolverType>(std::move(linear_solver));
+
+    g2o::SparseOptimizer optimizer;
+    optimizer.setVerbose(false);
+    optimizer.setAlgorithm(new g2o::OptimizationAlgorithmLevenberg(std::move(block_solver)));
+
+    auto* pose_vertex = new g2o::VertexSE3Expmap();
+    pose_vertex->setId(0);
+    pose_vertex->setEstimate(g2o::SE3Quat(initial_R_eigen, initial_t_eigen));
+    if (!optimizer.addVertex(pose_vertex))
+    {
+        delete pose_vertex;
+        return {};
+    }
+
+    struct PoseEdge
+    {
+        int input_index{-1};
+        g2o::EdgeSE3ProjectXYZOnlyPose* edge{nullptr};
+    };
+    std::vector<PoseEdge> edges;
+    edges.reserve(result.object_points.size());
+
+    const cv::Mat& K = camera_->getK();
+    const double fx = K.at<double>(0, 0);
+    const double fy = K.at<double>(1, 1);
+    const double cx = K.at<double>(0, 2);
+    const double cy = K.at<double>(1, 2);
+    constexpr double kMonoChi2Threshold = 5.991;
+    const double huber_delta = std::sqrt(kMonoChi2Threshold);
+
+    for (int i = 0; i < static_cast<int>(result.object_points.size()); ++i)
+    {
+        const cv::Point3d& point = result.object_points[i];
         if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
             continue;
 
-        const cv::Mat point_world = 
-            (cv::Mat_<double>(3, 1) << point.x, point.y, point.z);
-        const cv::Mat point_camera = result.R * point_world + result.tvec;
+        auto* edge = new g2o::EdgeSE3ProjectXYZOnlyPose();
+        edge->setVertex(0, pose_vertex);
+        edge->setMeasurement(Eigen::Vector2d(result.img_points[i].x,
+                                             result.img_points[i].y));
 
-        if (!cv::checkRange(point_camera))
+        double inv_sigma2 = 1.0;
+        if (i < static_cast<int>(result.candidate_features.size()) &&
+            result.candidate_features[i] != nullptr)
+        {
+            const int level = std::clamp(result.candidate_features[i]->getLevel(),
+                                         0, levels_num_ - 1);
+            inv_sigma2 = std::pow(scale_factor_, -2.0 * level);
+        }
+        edge->setInformation(Eigen::Matrix2d::Identity() * inv_sigma2);
+        auto* robust_kernel = new g2o::RobustKernelHuber();
+        robust_kernel->setDelta(huber_delta);
+        edge->setRobustKernel(robust_kernel);
+        edge->fx = fx;
+        edge->fy = fy;
+        edge->cx = cx;
+        edge->cy = cy;
+        edge->Xw = Eigen::Vector3d(point.x, point.y, point.z);
+
+        if (!optimizer.addEdge(edge))
+        {
+            delete edge;
             continue;
+        }
+        edges.push_back({i, edge});
+    }
 
-        valid_inlier_num++;
-        
+    if (edges.size() < 6)
+        return {};
+
+    // ORB-SLAM2 logic reference: four 10-iteration rounds, classify edges
+    // by the 2-DoF chi-square gate, and remove the robust kernel for the last
+    // refinement rounds. Outlier decisions are local to this PnP result.
+    for (int iteration = 0; iteration < 4; ++iteration)
+    {
+        if (!optimizer.initializeOptimization(0))
+            return {};
+        optimizer.optimize(10);
+
+        for (auto& pose_edge : edges)
+        {
+            auto* edge = pose_edge.edge;
+            edge->computeError();
+            const bool inlier = std::isfinite(edge->chi2()) &&
+                                edge->chi2() <= kMonoChi2Threshold &&
+                                edge->isDepthPositive();
+            edge->setLevel(inlier ? 0 : 1);
+            if (iteration == 1)
+                edge->setRobustKernel(nullptr);
+        }
+    }
+
+    g2o::SE3Quat optimized_pose = pose_vertex->estimate();
+    result.R = eigenToCvRotation(optimized_pose.rotation().toRotationMatrix());
+    result.rvec.release();
+    cv::Rodrigues(result.R, result.rvec);
+    result.tvec = eigenToCvTranslation(optimized_pose.translation());
+
+    std::vector<cv::Point3d> inlier_object_points;
+    std::vector<cv::Point2f> inlier_img_points;
+    std::vector<int> inlier_indices;
+    inlier_object_points.reserve(edges.size());
+    inlier_img_points.reserve(edges.size());
+    inlier_indices.reserve(edges.size());
+
+    for (const auto& pose_edge : edges)
+    {
+        auto* edge = pose_edge.edge;
+        edge->computeError();
+        if (edge->level() != 0 || !std::isfinite(edge->chi2()) ||
+            edge->chi2() > kMonoChi2Threshold || !edge->isDepthPositive())
+        {
+            continue;
+        }
+        inlier_indices.push_back(pose_edge.input_index);
+        inlier_object_points.push_back(result.object_points[pose_edge.input_index]);
+        inlier_img_points.push_back(result.img_points[pose_edge.input_index]);
+    }
+
+    int positive_depth_num = 0;
+    for (const auto& point : inlier_object_points)
+    {
+        const cv::Mat point_camera = result.R *
+            (cv::Mat_<double>(3, 1) << point.x, point.y, point.z) + result.tvec;
         if (point_camera.at<double>(2, 0) > 1e-6)
             positive_depth_num++;
     }
 
-    constexpr int kMinPositiveDepthInliers = 6;
-    constexpr double kMinPositiveDepthRatio = 0.90;
-
-    if (positive_depth_num < kMinPositiveDepthInliers ||
-        static_cast<double>(positive_depth_num) / valid_inlier_num < kMinPositiveDepthRatio)
+    if (inlier_indices.size() < 6 || positive_depth_num < 6 ||
+        static_cast<double>(positive_depth_num) / inlier_indices.size() < 0.90)
     {
         return {};
     }
 
+    result.inlier_indices = cv::Mat(static_cast<int>(inlier_indices.size()), 1, CV_32S);
+    for (int i = 0; i < result.inlier_indices.rows; ++i)
+        result.inlier_indices.at<int>(i, 0) = inlier_indices[i];
+
+    result.inlier_num = static_cast<int>(inlier_indices.size());
+    result.ransac_reproj_error = computeMeanReprojectionError(
+        inlier_object_points, inlier_img_points, result.rvec, result.tvec);
+    result.optimized_reproj_error = result.ransac_reproj_error;
+    result.optimized = true;
     result.success = true;
     return result;
 }
@@ -950,9 +1035,13 @@ std::vector<PoseOptimizer::LocalBAObservation> PoseOptimizer::collectLocalBAObse
 }
 
 PoseOptimizer::LocalBAContext PoseOptimizer::buildLocalBAContext(
+    const std::shared_ptr<Map>& map,
     const std::shared_ptr<Frame>& cur_frame) const
 {
     LocalBAContext context;
+
+    if (map == nullptr)
+        return context;
 
     context.local_keyframes = collectLocalBAKeyframes(cur_frame);
     if (context.local_keyframes.empty())
@@ -1015,6 +1104,45 @@ PoseOptimizer::LocalBAContext PoseOptimizer::buildLocalBAContext(
             }),
         context.fixed_keyframes.end()
     );
+
+    for (const auto& keyframe : map->getKeyframes())
+    {
+        if (keyframe != nullptr && keyframe->isKeyframe())
+        {
+            context.map_origin_keyframe = keyframe;
+            break;
+        }
+    }
+
+    auto snapshot_keyframe_pose = [&context](const std::shared_ptr<Frame>& keyframe)
+    {
+        if (keyframe == nullptr ||
+            context.keyframe_poses.count(keyframe->getId()) > 0)
+        {
+            return;
+        }
+
+        cv::Mat R_cw;
+        cv::Mat t_cw;
+        keyframe->copyPose(R_cw, t_cw);
+        if (!R_cw.empty() && !t_cw.empty())
+            context.keyframe_poses.emplace(
+                keyframe->getId(), LocalBAContext::PoseSnapshot{R_cw, t_cw});
+    };
+
+    for (const auto& keyframe : context.local_keyframes)
+        snapshot_keyframe_pose(keyframe);
+    for (const auto& keyframe : context.fixed_keyframes)
+        snapshot_keyframe_pose(keyframe);
+
+    context.map_point_positions.reserve(context.local_map_points.size() * 2 + 1);
+    for (const auto& map_point : context.local_map_points)
+    {
+        if (map_point != nullptr && !map_point->isBad())
+            context.map_point_positions.emplace(map_point->getId(), map_point->getPos());
+    }
+
+    context.map_version = map->getVersion();
 
     return context;
 }
@@ -1730,17 +1858,24 @@ InitialMapOptimizationResult PoseOptimizer::optimizeInitialMap(const std::shared
 
 LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map, 
                                               const std::shared_ptr<Frame>& cur_keyframe,
-                                              const PnPResult& tracking_seed) const
+                                              const PnPResult& tracking_seed,
+                                              bool* abort_flag) const
 {
     LocalBAResult result;
 
-    if (camera_ == nullptr || map == nullptr || 
-        cur_keyframe == nullptr || !cur_keyframe->isKeyframe())
+    if (camera_ == nullptr || map == nullptr || cur_keyframe == nullptr)
     {   
         return result;
     }
 
-    const LocalBAContext context = buildLocalBAContext(cur_keyframe);
+    LocalBAContext context;
+    {
+        std::lock_guard<std::mutex> map_lock(map->getMutex());
+        if (!cur_keyframe->isKeyframe())
+            return result;
+
+        context = buildLocalBAContext(map, cur_keyframe);
+    }
 
     if (context.local_keyframes.size() < 3 ||
         context.local_map_points.size() < 20 ||
@@ -1773,19 +1908,9 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
 
     g2o::SparseOptimizer optimizer;
     optimizer.setVerbose(false);
+    if (abort_flag != nullptr)
+        optimizer.setForceStopFlag(abort_flag);
     optimizer.setAlgorithm(new g2o::OptimizationAlgorithmLevenberg(std::move(block_solver)));
-
-    const std::vector<std::shared_ptr<Frame>>& map_keyframes = map->getKeyframes();
-
-    std::shared_ptr<Frame> map_origin_keyframe;
-    for (const auto& keyframe : map_keyframes)
-    {
-        if (keyframe != nullptr && keyframe->isKeyframe())
-        {
-            map_origin_keyframe = keyframe;
-            break;
-        }
-    }
 
     int next_vertex_id = 0;
     bool has_fixed_pose = false;
@@ -1801,19 +1926,19 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
     g2o::VertexSE3Expmap* fallback_anchor_vertex = nullptr;
    
         auto add_pose_vertex = 
-        [&optimizer, &next_vertex_id](const std::shared_ptr<Frame>& keyframe, 
+        [&optimizer, &next_vertex_id, &context](const std::shared_ptr<Frame>& keyframe,
                                       bool fixed) -> g2o::VertexSE3Expmap*
         {
             Eigen::Matrix3d R_cw;
             Eigen::Vector3d t_cw;
 
-            cv::Mat R_cv;
-            cv::Mat t_cv;
-            keyframe->copyPose(R_cv, t_cv);
+            if (keyframe == nullptr)
+                return nullptr;
 
-            if (R_cv.empty() || t_cv.empty() ||
-                !cvToEigenRotation(R_cv, R_cw) ||
-                !cvToEigenTranslation(t_cv, t_cw))
+            const auto pose_it = context.keyframe_poses.find(keyframe->getId());
+            if (pose_it == context.keyframe_poses.end() ||
+                !cvToEigenRotation(pose_it->second.R_cw, R_cw) ||
+                !cvToEigenTranslation(pose_it->second.t_cw, t_cw))
             {
                 return nullptr;
             }
@@ -1834,13 +1959,13 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
 
     for (const auto& keyframe : context.local_keyframes)
     {
-        if (keyframe == nullptr || !keyframe->isKeyframe() ||
+        if (keyframe == nullptr ||
             !local_keyframe_ids.insert(keyframe->getId()).second)
         {
             continue;
         }
 
-        const bool is_map_origin = (keyframe == map_origin_keyframe);
+        const bool is_map_origin = (keyframe == context.map_origin_keyframe);
         g2o::VertexSE3Expmap* vertex = add_pose_vertex(keyframe, is_map_origin);
 
         if (vertex == nullptr)
@@ -1858,7 +1983,7 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
 
     for (const auto& keyframe : context.fixed_keyframes)
     {
-        if (keyframe == nullptr || !keyframe->isKeyframe() ||
+        if (keyframe == nullptr ||
             local_keyframe_ids.count(keyframe->getId()) > 0 ||
             pose_vertices.count(keyframe->getId()) > 0)
         {
@@ -1885,10 +2010,14 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
 
     for (const auto& map_point : context.local_map_points)
     {
-        if (map_point == nullptr || map_point->isBad())
+        if (map_point == nullptr)
             continue;
 
-        const cv::Point3d& point = map_point->getPos();
+        const auto point_it = context.map_point_positions.find(map_point->getId());
+        if (point_it == context.map_point_positions.end())
+            continue;
+
+        const cv::Point3d& point = point_it->second;
 
         if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
             continue;
@@ -1922,8 +2051,7 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
     for (const auto& observation : context.observations)
     {
         if (observation.keyframe == nullptr || observation.map_point == nullptr ||
-            observation.feature == nullptr || observation.map_point->isBad() ||
-            observation.feature->getMapPoint() != observation.map_point)
+            observation.feature == nullptr)
         {
             continue;
         }
@@ -1976,6 +2104,12 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
     if (optimizer.optimize(5) <= 0)
         return result;
 
+    if (abort_flag != nullptr && *abort_flag)
+    {
+        result.rejection_reason = "ba_aborted_new_keyframe";
+        return result;
+    }
+
     optimizer.computeActiveErrors();
 
     for (const auto& graph_edge : graph_edges)
@@ -1994,6 +2128,12 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
 
     if (optimizer.optimize(10) <= 0)
         return result;
+
+    if (abort_flag != nullptr && *abort_flag)
+    {
+        result.rejection_reason = "ba_aborted_new_keyframe";
+        return result;
+    }
 
     optimizer.computeActiveErrors();
 
@@ -2028,7 +2168,7 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
 
     for (const auto& keyframe : context.local_keyframes)
     {
-        if (keyframe == nullptr || !keyframe->isKeyframe())
+        if (keyframe == nullptr)
             continue;
 
         const auto vertex_it = pose_vertices.find(keyframe->getId());
@@ -2052,7 +2192,7 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
 
     for (const auto& map_point : context.local_map_points)
     {
-        if (map_point == nullptr || map_point->isBad())
+        if (map_point == nullptr)
             continue;
 
         const auto vertex_it = point_vertices.find(map_point->getId());
@@ -2069,6 +2209,11 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
             {map_point, cv::Point3d(estimate[0], estimate[1], estimate[2])});
     }
 
+    std::unordered_map<std::size_t, cv::Point3d> candidate_map_point_positions;
+    candidate_map_point_positions.reserve(optimized_points.size() * 2 + 1);
+    for (const auto& optimized_point : optimized_points)
+        candidate_map_point_positions.emplace(optimized_point.map_point->getId(), optimized_point.position);
+
     const auto current_pose_it = 
         std::find_if(optimized_poses.begin(), optimized_poses.end(),
                      [&cur_keyframe](const OptimizedPose& pose)
@@ -2079,12 +2224,38 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
     if (current_pose_it == optimized_poses.end())
         return result;
 
-    if (!validateLocalBACandidate(tracking_seed, 
-                                  current_pose_it->R_cw, 
-                                  current_pose_it->t_cw, 
-                                  result.seed_reproj_error,
-                                  result.candidate_seed_reproj_error))
+    const bool candidate_accepted = validateLocalBACandidate(
+        tracking_seed,
+        current_pose_it->R_cw,
+        current_pose_it->t_cw,
+        candidate_map_point_positions,
+        result.seed_reproj_error,
+        result.candidate_seed_reproj_error);
+
+    if (!candidate_accepted)
     {
+        result.rejection_reason = "candidate_tracking_seed_validation";
+        return result;
+    }
+
+    // The expensive solve used only the immutable context above. Re-enter the
+    // map transaction only to validate and publish a complete candidate.
+    if (abort_flag != nullptr && *abort_flag)
+    {
+        result.rejection_reason = "ba_aborted_new_keyframe";
+        return result;
+    }
+
+    std::lock_guard<std::mutex> map_lock(map->getMutex());
+    if (map->getVersion() != context.map_version || !cur_keyframe->isKeyframe())
+    {
+        result.rejection_reason = "stale_map_snapshot";
+        return result;
+    }
+
+    if (abort_flag != nullptr && *abort_flag)
+    {
+        result.rejection_reason = "ba_aborted_new_keyframe";
         return result;
     }
 
@@ -2167,6 +2338,8 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
         keyframe->updateConnections();
         map->recordCovisibilityConstraints(keyframe);
     }
+
+    map->markModified();
 
     return result;
 }
@@ -2315,6 +2488,24 @@ bool PoseOptimizer::optimizeEssentialGraph(const std::vector<std::shared_ptr<Fra
     if (optimizer.optimize(kMaxIterations) <= 0)
         return false;
 
+    // Build all corrected map-point positions in the optimizer candidate.  Do
+    // not mutate the live map until every pose and point has passed validation;
+    // otherwise a late invalid Sim3 vertex can leave a partial graph correction
+    // behind even though this function reports failure.
+    struct OptimizedMapPoint
+    {
+        std::shared_ptr<MapPoint> map_point;
+        cv::Point3d position;
+    };
+    struct OptimizedPoseState
+    {
+        std::shared_ptr<Frame> keyframe;
+        cv::Mat R_cw;
+        cv::Mat t_cw;
+    };
+    std::vector<OptimizedMapPoint> optimized_map_points;
+    optimized_map_points.reserve(map_points.size());
+
     // fixed camera poses, solve the map point
     for (const auto& map_point : map_points)
     {
@@ -2356,11 +2547,15 @@ bool PoseOptimizer::optimizeEssentialGraph(const std::vector<std::shared_ptr<Fra
         if (!point_world_after.allFinite())
             continue;
 
-        map_point->setPos(cv::Point3d(point_world_after[0],
-                                      point_world_after[1],
-                                      point_world_after[2]));                  
+        optimized_map_points.push_back({
+            map_point,
+            cv::Point3d(point_world_after[0],
+                        point_world_after[1],
+                        point_world_after[2])});
     }
 
+    std::vector<OptimizedPoseState> optimized_poses;
+    optimized_poses.reserve(states.size());
     for (const auto& state : states)
     {
         const g2o::Sim3& optimized_sim3 = state.vertex->estimate();
@@ -2374,8 +2569,30 @@ bool PoseOptimizer::optimizeEssentialGraph(const std::vector<std::shared_ptr<Fra
         const Eigen::Vector3d t_cw = 
             optimized_sim3.translation() / scale;
 
-        state.keyframe->setPose(eigenToCvRotation(R_cw), eigenToCvTranslation(t_cw));
+        if (!R_cw.allFinite() || !t_cw.allFinite())
+            return false;
+
+        optimized_poses.push_back({state.keyframe,
+                                   eigenToCvRotation(R_cw),
+                                   eigenToCvTranslation(t_cw)});
     }
+
+    if (optimized_poses.size() != states.size())
+        return false;
+
+    // The caller holds the map transaction while invoking this function.  The
+    // final writes are deliberately grouped here so the official map observes
+    // either the complete essential-graph correction or no correction at all.
+    for (const auto& optimized_pose : optimized_poses)
+        optimized_pose.keyframe->setPose(optimized_pose.R_cw, optimized_pose.t_cw);
+
+    for (const auto& optimized_point : optimized_map_points)
+        optimized_point.map_point->setPos(optimized_point.position);
+
+    // Sequential/covisibility measurements depend on the corrected poses;
+    // refresh them after the complete commit while preserving the verified loop
+    // edge measurement.
+    // (The map version is advanced by the caller's surrounding transaction.)
 
     return true;
 }

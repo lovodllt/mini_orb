@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <opencv2/calib3d.hpp>
 
@@ -19,6 +20,37 @@ double pointNorm(const cv::Point3d& p)
 double dotPoint(const cv::Point3d& a, const cv::Point3d& b)
 {
     return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+// ORB-SLAM2 logic reference: GetMin/MaxDistanceInvariance adds a 0.8/1.2
+// margin around the reference pyramid-derived range before projection gating.
+double minDistanceInvariance(double min_distance)
+{
+    return 0.8 * min_distance;
+}
+
+double maxDistanceInvariance(double max_distance)
+{
+    return 1.2 * max_distance;
+}
+
+// ORB-SLAM2 logic reference: descriptors are 256-bit ORB rows. Keep the
+// same Hamming metric while avoiding a per-candidate OpenCV norm dispatch.
+int orbDescriptorDistance(const cv::Mat& lhs, const cv::Mat& rhs)
+{
+    if (lhs.rows != 1 || rhs.rows != 1 || lhs.cols != 32 || rhs.cols != 32 ||
+        lhs.type() != CV_8U || rhs.type() != CV_8U ||
+        !lhs.isContinuous() || !rhs.isContinuous())
+    {
+        return static_cast<int>(cv::norm(lhs, rhs, cv::NORM_HAMMING));
+    }
+
+    const auto* lhs_words = lhs.ptr<std::uint32_t>();
+    const auto* rhs_words = rhs.ptr<std::uint32_t>();
+    int distance = 0;
+    for (int word = 0; word < 8; ++word)
+        distance += __builtin_popcount(lhs_words[word] ^ rhs_words[word]);
+    return distance;
 }
 
 } // namespace
@@ -51,6 +83,9 @@ PnPResult Tracker::estimatePoseByPnP(const InitializationResult& init_result) co
     for (const auto& map_point : init_result.map_points)
     {
         if (map_point == nullptr)
+            continue;
+
+        if (map_point->isBad())
             continue;
 
         const std::shared_ptr<Feature>& cur_feature = map_point->getCurFeature();
@@ -96,7 +131,9 @@ bool Tracker::getFeatureDescriptor(const std::shared_ptr<Feature>& feature, cv::
     if (feature_idx < 0 || feature_idx >= frame->getDescriptors().rows)
         return false;
 
-    descriptor = frame->getDescriptors().row(feature_idx).clone();
+    // ORB-SLAM2 logic reference: keep a descriptor row view during matching;
+    // the owning Frame is retained by the Feature and remains alive here.
+    descriptor = frame->getDescriptors().row(feature_idx);
     return true;
 }
 
@@ -107,11 +144,9 @@ bool Tracker::getMapPointDescriptor(const std::shared_ptr<MapPoint>& map_point, 
     if (map_point == nullptr)
         return false;
 
-    if (map_point->hasRepresentativeDescriptor())
-    {
-        descriptor = map_point->getRepresentativeDescriptor().clone();
+    descriptor = map_point->getRepresentativeDescriptor();
+    if (!descriptor.empty())
         return true;
-    }
 
     const std::shared_ptr<Feature> ref_feature = selectRefFeature(map_point);
     return getFeatureDescriptor(ref_feature, descriptor);
@@ -120,14 +155,20 @@ bool Tracker::getMapPointDescriptor(const std::shared_ptr<MapPoint>& map_point, 
 bool Tracker::setInitialPoseGuessFromFrame(const std::shared_ptr<Frame>& frame,
                                            PnPResult& result) const
 {
-    if (frame == nullptr || frame->getRcw().empty() || frame->getTcw().empty())
+    if (frame == nullptr)
+        return false;
+
+    cv::Mat R_cw;
+    cv::Mat t_cw;
+    frame->copyPose(R_cw, t_cw);
+    if (R_cw.empty() || t_cw.empty())
         return false;
 
     cv::Mat rvec;
-    cv::Rodrigues(frame->getRcw(), rvec);
+    cv::Rodrigues(R_cw, rvec);
 
     rvec.convertTo(result.rvec, CV_64F);
-    frame->getTcw().convertTo(result.tvec, CV_64F);
+    t_cw.convertTo(result.tvec, CV_64F);
 
     return true;
 }
@@ -135,18 +176,21 @@ bool Tracker::setInitialPoseGuessFromFrame(const std::shared_ptr<Frame>& frame,
 bool Tracker::isProjectionMatchReliable(int best_distance,
                                         int second_best_distance,
                                         int best_level,
-                                        int second_best_level) const
+                                        int second_best_level,
+                                        bool apply_ratio_test) const
 {
     if (best_distance > matcher_.getMaxHammingDistance())
         return false;
 
-    if (second_best_distance == std::numeric_limits<int>::max())
-        return true;
-
-    constexpr float kProjectionRatio = 0.9f;
-
-    if (best_level == second_best_level &&
-        static_cast<float>(best_distance) >= kProjectionRatio * static_cast<float>(second_best_distance))
+    // ORB-SLAM2 logic reference: local-map projection matching applies the
+    // configured NN ratio only when the best and second-best features are in
+    // the same pyramid level. Motion-model and relocalization projection
+    // paths intentionally pass apply_ratio_test=false.
+    if (apply_ratio_test &&
+        second_best_distance != std::numeric_limits<int>::max() &&
+        best_level == second_best_level &&
+        static_cast<float>(best_distance) >=
+            matcher_.getRatioThreshold() * static_cast<float>(second_best_distance))
     {
         return false;
     }
@@ -164,8 +208,46 @@ float Tracker::computeSearchRadius(int predicted_level) const
     return base_projection_search_radius_ * std::pow(scale_factor_, clamped_level);
 }
 
-bool Tracker::projectMapPointToFrame(const std::shared_ptr<MapPoint>& map_point, 
-                                     const std::shared_ptr<Frame>& frame, 
+Tracker::ProjectionPose Tracker::snapshotProjectionPose(
+    const std::shared_ptr<Frame>& frame) const
+{
+    ProjectionPose pose;
+    if (frame == nullptr)
+        return pose;
+
+    frame->copyPose(pose.R_cw, pose.t_cw);
+    if (pose.R_cw.rows != 3 || pose.R_cw.cols != 3 ||
+        pose.t_cw.rows != 3 || pose.t_cw.cols != 1)
+    {
+        pose.R_cw.release();
+        pose.t_cw.release();
+        return pose;
+    }
+
+    const double tx = pose.t_cw.at<double>(0, 0);
+    const double ty = pose.t_cw.at<double>(1, 0);
+    const double tz = pose.t_cw.at<double>(2, 0);
+    const double r00 = pose.R_cw.at<double>(0, 0);
+    const double r01 = pose.R_cw.at<double>(0, 1);
+    const double r02 = pose.R_cw.at<double>(0, 2);
+    const double r10 = pose.R_cw.at<double>(1, 0);
+    const double r11 = pose.R_cw.at<double>(1, 1);
+    const double r12 = pose.R_cw.at<double>(1, 2);
+    const double r20 = pose.R_cw.at<double>(2, 0);
+    const double r21 = pose.R_cw.at<double>(2, 1);
+    const double r22 = pose.R_cw.at<double>(2, 2);
+    pose.camera_center = cv::Point3d(
+        -(r00 * tx + r10 * ty + r20 * tz),
+        -(r01 * tx + r11 * ty + r21 * tz),
+        -(r02 * tx + r12 * ty + r22 * tz));
+    pose.image_width = frame->getImg().cols;
+    pose.image_height = frame->getImg().rows;
+    pose.valid = pose.image_width > 0 && pose.image_height > 0;
+    return pose;
+}
+
+bool Tracker::projectMapPointToFrame(const std::shared_ptr<MapPoint>& map_point,
+                                     const ProjectionPose& pose,
                                      cv::Point2f& projected_pixel,
                                      double& depth,
                                      double& camera_distance) const
@@ -174,32 +256,43 @@ bool Tracker::projectMapPointToFrame(const std::shared_ptr<MapPoint>& map_point,
     depth = 0.0;
     camera_distance = 0.0;
 
-    if (camera_ == nullptr || map_point == nullptr || frame == nullptr)
+    if (camera_ == nullptr || map_point == nullptr || !pose.valid)
         return false;
 
     const cv::Point3d& pw = map_point->getPos();
-    const cv::Mat point_w = (cv::Mat_<double>(3, 1) << pw.x, pw.y, pw.z);
-    const cv::Mat point_c = frame->getRcw() * point_w + frame->getTcw();
+    const double x = pose.R_cw.at<double>(0, 0) * pw.x +
+                     pose.R_cw.at<double>(0, 1) * pw.y +
+                     pose.R_cw.at<double>(0, 2) * pw.z +
+                     pose.t_cw.at<double>(0, 0);
+    const double y = pose.R_cw.at<double>(1, 0) * pw.x +
+                     pose.R_cw.at<double>(1, 1) * pw.y +
+                     pose.R_cw.at<double>(1, 2) * pw.z +
+                     pose.t_cw.at<double>(1, 0);
+    const double z = pose.R_cw.at<double>(2, 0) * pw.x +
+                     pose.R_cw.at<double>(2, 1) * pw.y +
+                     pose.R_cw.at<double>(2, 2) * pw.z +
+                     pose.t_cw.at<double>(2, 0);
 
-    depth = point_c.at<double>(2, 0);
+    depth = z;
     if (depth <= 0.0)
         return false;
 
-    const cv::Point3d camera_center = frame->getCameraCenter();
-    const cv::Point3d view = pw - camera_center;
+    const cv::Point3d view = pw - pose.camera_center;
     camera_distance = pointNorm(view);
     if (camera_distance <= 1e-6)
         return false;
 
-    if (map_point->hasValidViewStatistics())
+    cv::Point3d normal;
+    double min_distance = 0.0;
+    double max_distance = 0.0;
+    if (map_point->getViewStatistics(normal, min_distance, max_distance))
     {
-        if (camera_distance < map_point->getMinDistance() || 
-            camera_distance > map_point->getMaxDistance())
+        if (camera_distance < minDistanceInvariance(min_distance) ||
+            camera_distance > maxDistanceInvariance(max_distance))
         {
             return false;
         }
 
-        const cv::Point3d& normal = map_point->getNormalVector();
         const double normal_norm = pointNorm(normal);
         if (normal_norm <= 1e-6)
             return false;
@@ -209,20 +302,16 @@ bool Tracker::projectMapPointToFrame(const std::shared_ptr<MapPoint>& map_point,
             return false;
     }
 
-    Eigen::Vector3d pc(point_c.at<double>(0, 0), 
-                       point_c.at<double>(1, 0), 
-                       point_c.at<double>(2, 0));
+    Eigen::Vector3d pc(x, y, z);
 
     const Eigen::Vector2d pixel = camera_->Camera2Pixel(pc);
     projected_pixel.x = static_cast<float>(pixel(0));
     projected_pixel.y = static_cast<float>(pixel(1));
 
-    const int img_cols = frame->getImg().cols;
-    const int img_rows = frame->getImg().rows;
     const int border = 10;
 
-    if (projected_pixel.x < border || projected_pixel.x >= img_cols - border ||
-        projected_pixel.y < border || projected_pixel.y >= img_rows - border)
+    if (projected_pixel.x < border || projected_pixel.x >= pose.image_width - border ||
+        projected_pixel.y < border || projected_pixel.y >= pose.image_height - border)
     {
         return false;
     }
@@ -230,29 +319,42 @@ bool Tracker::projectMapPointToFrame(const std::shared_ptr<MapPoint>& map_point,
     return true;
 }
 
-int Tracker::findBestFeatureInArea(const std::shared_ptr<Frame>& frame,
-                                   const cv::Point2f& projected_pixel,
-                                   int predicted_level, 
-                                   const cv::Mat& map_descriptor,
-                                   const std::unordered_set<int>& used_feature_indices,
-                                   float search_radius) const
+Tracker::ProjectionFeatureSearchResult Tracker::findBestFeatureInArea(
+    const std::shared_ptr<Frame>& frame,
+    const cv::Point2f& projected_pixel,
+    int predicted_level,
+    const cv::Mat& map_descriptor,
+    const std::unordered_set<int>& used_feature_indices,
+    float search_radius,
+    bool apply_ratio_test) const
 {
+    ProjectionFeatureSearchResult result;
+
     if (frame == nullptr || map_descriptor.empty())
-        return -1;
+        return result;
 
     const std::vector<std::shared_ptr<Feature>>& features = frame->getFeatures();
     const cv::Mat& descriptors = frame->getDescriptors();
 
     const int min_level = std::max(0, predicted_level - 1);
-    const int max_level = std::min(levels_num_ - 1, predicted_level + 1);
+    // ORB-SLAM2 logic reference: SearchByProjection considers the predicted
+    // octave and the immediately finer octave, never a coarser one. A
+    // coarser candidate is more likely to be a spatially nearby alias after
+    // motion prediction and can perturb the local-map pose refinement.
+    const int max_level = std::min(levels_num_ - 1, predicted_level);
+
+    // The radius gate is equivalent in squared form and avoids constructing a
+    // temporary point plus a square root for every projected map-point.
+    const float search_radius_squared = search_radius * search_radius;
 
     const std::vector<int> candidate_indices = frame->getFeatureIndicesInArea(projected_pixel, 
                                                                               search_radius, 
                                                                               min_level, 
                                                                               max_level);
 
-    if (candidate_indices.empty())
-        return -1;
+    result.has_spatial_candidates = !candidate_indices.empty();
+    if (!result.has_spatial_candidates)
+        return result;
 
     int best_idx = -1;
     int best_distance = std::numeric_limits<int>::max();
@@ -266,22 +368,28 @@ int Tracker::findBestFeatureInArea(const std::shared_ptr<Frame>& frame,
         if (used_feature_indices.count(i) > 0)
             continue;
 
+        if (i < 0 || i >= static_cast<int>(features.size()) ||
+            i >= descriptors.rows)
+        {
+            continue;
+        }
+
         const std::shared_ptr<Feature>& feature = features[i];
         if (feature == nullptr)
             continue;
 
         const int feature_level = feature->getLevel();
 
-        const double pixel_distance = cv::norm(feature->getKeyPoint().pt - projected_pixel);
-        if (pixel_distance > search_radius)
+        const cv::Point2f pixel_delta = feature->getKeyPoint().pt - projected_pixel;
+        const float pixel_distance_squared = pixel_delta.x * pixel_delta.x +
+                                              pixel_delta.y * pixel_delta.y;
+        if (pixel_distance_squared > search_radius_squared)
             continue;
 
         const cv::Mat cur_descriptor = descriptors.row(i);
-        const int descriptor_distance = 
-            static_cast<int>(cv::norm(cur_descriptor, map_descriptor, cv::NORM_HAMMING));
+        const int descriptor_distance = orbDescriptorDistance(cur_descriptor, map_descriptor);
 
-        if (descriptor_distance > matcher_.getMaxHammingDistance())
-            continue;
+        result.has_available_descriptor = true;
 
         if (descriptor_distance < best_distance)
         {
@@ -300,17 +408,25 @@ int Tracker::findBestFeatureInArea(const std::shared_ptr<Frame>& frame,
     }
 
     if (best_idx < 0)
-        return -1;
+        return result;
 
     if (!isProjectionMatchReliable(best_distance, 
                                    second_best_distance, 
                                    best_level, 
-                                   second_best_level))
+                                   second_best_level,
+                                   apply_ratio_test))
     {
-        return -1;
+        result.hamming_rejected = best_distance > matcher_.getMaxHammingDistance();
+        result.ratio_rejected = !result.hamming_rejected && apply_ratio_test &&
+            second_best_distance != std::numeric_limits<int>::max() &&
+            best_level == second_best_level &&
+            static_cast<float>(best_distance) >= matcher_.getRatioThreshold() *
+                static_cast<float>(second_best_distance);
+        return result;
     }
 
-    return best_idx;
+    result.feature_idx = best_idx;
+    return result;
 }
 
 PnPResult Tracker::trackFrameByMap(const std::shared_ptr<Map>& map,
@@ -319,7 +435,8 @@ PnPResult Tracker::trackFrameByMap(const std::shared_ptr<Map>& map,
     if (map == nullptr)
         return {};
 
-    return trackFrameByDescriptorMapPoints(map->getMapPoints(), cur_frame);
+    const std::vector<std::shared_ptr<MapPoint>> map_points = map->copyMapPoints();
+    return trackFrameByDescriptorMapPoints(map_points, cur_frame);
 }
 
 PnPResult Tracker::trackFrameByBoWKeyframe(const std::shared_ptr<Frame>& keyframe, 
@@ -394,15 +511,19 @@ PnPResult Tracker::trackFrameByMapPoints(const std::vector<std::shared_ptr<MapPo
 
     std::vector<std::shared_ptr<MapPoint>> visible_map_points;
     PnPResult best_result = 
-        trackFrameByProjection(map_points, cur_frame, 1.0f, false, &visible_map_points);
+        trackFrameByProjection(map_points, cur_frame, 1.0f, false, true, true,
+                                &visible_map_points);
 
-    if (best_result.object_points.size() < kMinMotionModelMatches)
+    constexpr std::size_t kExpandProjectionMatches = 40;
+    if (best_result.object_points.size() < kExpandProjectionMatches)
     {
         std::vector<std::shared_ptr<MapPoint>> expanded_visible_map_points;
         PnPResult expanded_result = trackFrameByProjection(map_points, 
                                                            cur_frame, 
                                                            2.0f, 
                                                            false, 
+                                                           true,
+                                                           true,
                                                            &expanded_visible_map_points);
 
         if (expanded_result.success ||
@@ -412,6 +533,15 @@ PnPResult Tracker::trackFrameByMapPoints(const std::vector<std::shared_ptr<MapPo
             visible_map_points = std::move(expanded_visible_map_points);
         }
     }
+
+    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R12 frame="
+                    << (cur_frame != nullptr ? cur_frame->getId() : 0)
+                    << " stage=motion_projection input=" << map_points.size()
+                    << " visible=" << visible_map_points.size()
+                    << " candidates=" << best_result.object_points.size()
+                    << " success=" << (best_result.success ? 1 : 0)
+                    << " inliers=" << best_result.inlier_num
+                    << " reproj=" << best_result.optimized_reproj_error);
 
     if (!best_result.success || best_result.inlier_num < kMinMotionModelMatches)
     {
@@ -424,10 +554,17 @@ PnPResult Tracker::trackFrameByMapPoints(const std::vector<std::shared_ptr<MapPo
              (descriptor_result.inlier_num == best_result.inlier_num && 
               descriptor_result.optimized_reproj_error < best_result.optimized_reproj_error));
 
-        if (descriptor_result_better)
-        {
-            best_result = std::move(descriptor_result);
-        }
+    if (descriptor_result_better)
+    {
+        best_result = std::move(descriptor_result);
+    }
+
+    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R12 frame="
+                    << (cur_frame != nullptr ? cur_frame->getId() : 0)
+                    << " stage=motion_final success=" << (best_result.success ? 1 : 0)
+                    << " inliers=" << best_result.inlier_num
+                    << " candidates=" << best_result.object_points.size()
+                    << " reproj=" << best_result.optimized_reproj_error);
     }
 
     updateProjectionStatistics(visible_map_points, best_result);
@@ -465,18 +602,86 @@ PnPResult Tracker::trackFrameByMotionModel(const std::shared_ptr<Frame>& last_fr
         return {};
 
     PnPResult projection_result = 
-        trackFrameByProjection(last_frame_map_points, cur_frame, 1.0f, false);
+        trackFrameByProjection(last_frame_map_points, cur_frame, 1.0f, false, false, true);
 
     if (projection_result.object_points.size() >= kMinProjectionMatches)
         return projection_result;
 
     PnPResult expanded_projection_result = 
-        trackFrameByProjection(last_frame_map_points, cur_frame, 2.0f, false);
+        trackFrameByProjection(last_frame_map_points, cur_frame, 2.0f, false, false, true);
 
     if (expanded_projection_result.object_points.size() < kMinProjectionMatches)
         return {};
 
     return expanded_projection_result;
+}
+
+PnPResult Tracker::trackFrameByReferenceFrame(
+    const std::shared_ptr<Frame>& reference_frame,
+    const std::shared_ptr<Frame>& cur_frame) const
+{
+    PnPResult result;
+
+    if (reference_frame == nullptr || cur_frame == nullptr ||
+        !reference_frame->hasFeatures() || !cur_frame->hasFeatures() ||
+        pose_optimizer_ == nullptr)
+    {
+        return result;
+    }
+
+    const std::vector<std::pair<int, int>> matches =
+        matcher_.matchFrames(*reference_frame, *cur_frame);
+    const std::vector<std::shared_ptr<Feature>>& reference_features =
+        reference_frame->getFeatures();
+    const std::vector<std::shared_ptr<Feature>>& current_features =
+        cur_frame->getFeatures();
+
+    std::unordered_set<std::size_t> used_map_point_ids;
+    used_map_point_ids.reserve(matches.size() * 2 + 1);
+
+    result.object_points.reserve(matches.size());
+    result.img_points.reserve(matches.size());
+    result.candidate_map_points.reserve(matches.size());
+    result.candidate_features.reserve(matches.size());
+
+    for (const auto& match : matches)
+    {
+        const int reference_idx = match.first;
+        const int current_idx = match.second;
+        if (reference_idx < 0 || reference_idx >= static_cast<int>(reference_features.size()) ||
+            current_idx < 0 || current_idx >= static_cast<int>(current_features.size()))
+        {
+            continue;
+        }
+
+        const std::shared_ptr<Feature>& reference_feature = reference_features[reference_idx];
+        const std::shared_ptr<Feature>& current_feature = current_features[current_idx];
+        if (reference_feature == nullptr || current_feature == nullptr ||
+            !reference_feature->hasMapPoint())
+        {
+            continue;
+        }
+
+        const std::shared_ptr<MapPoint> map_point = reference_feature->getMapPoint();
+        if (map_point == nullptr || map_point->isBad() ||
+            !used_map_point_ids.insert(map_point->getId()).second)
+        {
+            continue;
+        }
+
+        result.object_points.push_back(map_point->getPos());
+        result.img_points.push_back(current_feature->getKeyPoint().pt);
+        result.candidate_map_points.push_back(map_point);
+        result.candidate_features.push_back(current_feature);
+    }
+
+    if (result.object_points.size() < 6 ||
+        !setInitialPoseGuessFromFrame(cur_frame, result))
+    {
+        return {};
+    }
+
+    return pose_optimizer_->optimize(result);
 }
 
 void Tracker::updateProjectionStatistics(
@@ -512,6 +717,9 @@ PnPResult Tracker::trackFrameByDescriptorMapPoints(
     for (const auto& map_point : map_points)
     {
         if (map_point == nullptr)
+            continue;
+
+        if (map_point->isBad())
             continue;
 
         const std::shared_ptr<Feature> ref_feature = selectRefFeature(map_point);
@@ -617,6 +825,8 @@ void Tracker::appendProjectionCorrespondences(
     const std::shared_ptr<Frame>& cur_frame,
     float radius_scale,
     bool update_statistics,
+    bool apply_ratio_test,
+    bool apply_view_gate,
     std::unordered_set<std::size_t>& used_map_point_ids,
     std::unordered_set<int>& used_feature_indices,
     PnPResult& result,
@@ -631,27 +841,100 @@ void Tracker::appendProjectionCorrespondences(
         visible_map_points->reserve(map_points.size());
     }
 
+    std::size_t skipped_map_points = 0;
+    std::size_t descriptor_missing = 0;
+    std::size_t projection_rejected = 0;
+    std::size_t distance_low_rejected = 0;
+    std::size_t distance_high_rejected = 0;
+    std::size_t view_angle_rejected = 0;
+    std::size_t border_rejected = 0;
+    std::size_t feature_missing = 0;
+    std::size_t no_spatial_candidate = 0;
+    std::size_t no_available_descriptor = 0;
+    std::size_t hamming_rejected = 0;
+    std::size_t ratio_rejected = 0;
+    std::size_t matched_num = 0;
+
+    const ProjectionPose projection_pose = snapshotProjectionPose(cur_frame);
+    if (!projection_pose.valid)
+        return;
+
     for (const auto& map_point : map_points)
     {
         if (map_point == nullptr || map_point->isBad() ||
             used_map_point_ids.count(map_point->getId()) > 0)
         {
+            skipped_map_points++;
             continue;
         }
 
         const std::shared_ptr<Feature> ref_feature = selectRefFeature(map_point);
         if (ref_feature == nullptr)
+        {
+            descriptor_missing++;
             continue;
+        }
 
         cv::Mat descriptor;
         if (!getMapPointDescriptor(map_point, descriptor))
+        {
+            descriptor_missing++;
             continue;
+        }
 
         cv::Point2f projected_pixel;
         double depth = 0.0;
         double camera_distance = 0.0;
-        if (!projectMapPointToFrame(map_point, cur_frame, projected_pixel, depth, camera_distance))
+
+        cv::Point3d normal;
+        double min_distance = 0.0;
+        double max_distance = 0.0;
+        if (apply_view_gate && map_point->getViewStatistics(normal, min_distance, max_distance))
+        {
+            const cv::Point3d point_world = map_point->getPos();
+            const cv::Point3d camera_center = projection_pose.camera_center;
+            const cv::Point3d view = point_world - camera_center;
+            const double predicted_distance = pointNorm(view);
+
+            if (predicted_distance < minDistanceInvariance(min_distance))
+            {
+                distance_low_rejected++;
+                continue;
+            }
+            else if (predicted_distance > maxDistanceInvariance(max_distance))
+            {
+                distance_high_rejected++;
+                continue;
+            }
+            else
+            {
+                const double normal_norm = pointNorm(normal);
+                const double view_cos = normal_norm > 1e-6
+                    ? dotPoint(view, normal) /
+                      (predicted_distance * normal_norm)
+                    : -1.0;
+                if (view_cos < 0.5)
+                {
+                    view_angle_rejected++;
+                    continue;
+                }
+            }
+        }
+
+        if (!projectMapPointToFrame(map_point, projection_pose,
+                                    projected_pixel, depth, camera_distance))
+        {
+            projection_rejected++;
+
+            if (projected_pixel.x < 10.0f ||
+                projected_pixel.x >= cur_frame->getImg().cols - 10.0f ||
+                projected_pixel.y < 10.0f ||
+                projected_pixel.y >= cur_frame->getImg().rows - 10.0f)
+            {
+                border_rejected++;
+            }
             continue;
+        }
 
         if (visible_map_points != nullptr)
             visible_map_points->push_back(map_point);
@@ -660,7 +943,7 @@ void Tracker::appendProjectionCorrespondences(
             map_point->increaseVisibleTimes();
 
         int predicted_level = ref_feature->getLevel();
-        if (map_point->hasValidViewStatistics())
+        if (apply_view_gate && map_point->getViewStatistics(normal, min_distance, max_distance))
         {
             predicted_level = 
                 map_point->predictScaleLevel(camera_distance, scale_factor_, levels_num_);
@@ -669,19 +952,31 @@ void Tracker::appendProjectionCorrespondences(
         const float search_radius =
             computeSearchRadius(predicted_level) * std::max(radius_scale, 0.5f);
 
-        const int cur_feature_idx = findBestFeatureInArea(cur_frame, 
-                                                          projected_pixel, 
-                                                          predicted_level, 
-                                                          descriptor, 
-                                                          used_feature_indices,
-                                                          search_radius);
+        const ProjectionFeatureSearchResult search_result = findBestFeatureInArea(
+            cur_frame, projected_pixel, predicted_level, descriptor,
+            used_feature_indices, search_radius, apply_ratio_test);
+        const int cur_feature_idx = search_result.feature_idx;
 
         if (cur_feature_idx < 0)
+        {
+            feature_missing++;
+            if (!search_result.has_spatial_candidates)
+                no_spatial_candidate++;
+            else if (!search_result.has_available_descriptor)
+                no_available_descriptor++;
+            else if (search_result.hamming_rejected)
+                hamming_rejected++;
+            else if (search_result.ratio_rejected)
+                ratio_rejected++;
             continue;
+        }
 
         const std::shared_ptr<Feature>& cur_feature = cur_frame->getFeatures()[cur_feature_idx];
         if (cur_feature == nullptr)
+        {
+            feature_missing++;
             continue;
+        }
 
         used_map_point_ids.insert(map_point->getId());
         used_feature_indices.insert(cur_feature_idx);
@@ -693,7 +988,29 @@ void Tracker::appendProjectionCorrespondences(
         result.img_points.push_back(cur_feature->getKeyPoint().pt);
         result.candidate_map_points.push_back(map_point);
         result.candidate_features.push_back(cur_feature);
+        matched_num++;
     }
+
+    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R19 frame=" << cur_frame->getId()
+                    << " timestamp_ns=" << static_cast<long long>(
+                           std::llround(cur_frame->getTimestamp() * 1e9))
+                    << " stage=projection radius=" << radius_scale
+                    << " ratio_test=" << (apply_ratio_test ? 1 : 0)
+                    << " input=" << map_points.size()
+                    << " skipped=" << skipped_map_points
+                    << " descriptor_missing=" << descriptor_missing
+                    << " projection_rejected=" << projection_rejected
+                    << " distance_low=" << distance_low_rejected
+                    << " distance_high=" << distance_high_rejected
+                    << " view_angle=" << view_angle_rejected
+                    << " border=" << border_rejected
+                    << " feature_missing=" << feature_missing
+                    << " no_spatial_candidate=" << no_spatial_candidate
+                    << " no_available_descriptor=" << no_available_descriptor
+                    << " hamming_rejected=" << hamming_rejected
+                    << " ratio_rejected=" << ratio_rejected
+                    << " matched=" << matched_num);
+
 }
 
 PnPResult Tracker::refinePoseWithLocalMap(
@@ -731,9 +1048,31 @@ PnPResult Tracker::refinePoseWithLocalMap(
                                     cur_frame, 
                                     1.0f, 
                                     false, 
+                                    true,
+                                    true,
                                     used_map_point_ids, 
                                     used_feature_indices, 
                                     combined_result);
+
+    const std::size_t first_pass_correspondences = combined_result.object_points.size();
+
+    // A slightly stale motion prediction can leave otherwise valid map points
+    // just outside the nominal search window. Enlarge the geometric search
+    // only when the first pass is sparse; PnP and reprojection checks still
+    // decide which correspondences are accepted.
+    constexpr std::size_t kSparseLocalMapCorrespondences = 50;
+    if (combined_result.object_points.size() < kSparseLocalMapCorrespondences)
+    {
+        appendProjectionCorrespondences(local_map_points,
+                                        cur_frame,
+                                        2.0f,
+                                        false,
+                                        true,
+                                        true,
+                                        used_map_point_ids,
+                                        used_feature_indices,
+                                        combined_result);
+    }
 
     if (combined_result.object_points.size() < 6 ||
         !setInitialPoseGuessFromFrame(cur_frame, combined_result))
@@ -741,7 +1080,7 @@ PnPResult Tracker::refinePoseWithLocalMap(
         return {};
     }
 
-    return pose_optimizer_->optimize(combined_result);
+    return pose_optimizer_->optimizeWithPosePrior(combined_result);
 }
 
 PnPResult Tracker::trackFrameByProjectionOnly(const std::vector<std::shared_ptr<MapPoint>>& map_points,
@@ -750,7 +1089,8 @@ PnPResult Tracker::trackFrameByProjectionOnly(const std::vector<std::shared_ptr<
                                               bool update_statistics) const
 {
     const float valid_radius_scale = radius_scale > 0.0f ? radius_scale : 1.0f;
-    return trackFrameByProjection(map_points, cur_frame, valid_radius_scale, update_statistics);
+    return trackFrameByProjection(map_points, cur_frame, valid_radius_scale,
+                                  update_statistics, false, true);
 }
 
 PnPResult Tracker::trackFrameByProjection(
@@ -758,6 +1098,8 @@ PnPResult Tracker::trackFrameByProjection(
     const std::shared_ptr<Frame>& cur_frame,
     float radius_scale,
     bool update_statistics,
+    bool apply_ratio_test,
+    bool apply_view_gate,
     std::vector<std::shared_ptr<MapPoint>>* visible_map_points) const
 {
     PnPResult result;
@@ -779,7 +1121,9 @@ PnPResult Tracker::trackFrameByProjection(
     appendProjectionCorrespondences(map_points, 
                                     cur_frame, 
                                     radius_scale, 
-                                    update_statistics, 
+                                    update_statistics,
+                                    apply_ratio_test,
+                                    apply_view_gate,
                                     used_map_point_ids, 
                                     used_feature_indices, 
                                     result, 

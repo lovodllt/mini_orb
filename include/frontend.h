@@ -4,6 +4,8 @@
 #include <memory>
 #include <string>
 #include <fstream>
+#include <limits>
+#include <cstdint>
 
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
@@ -166,6 +168,7 @@ private:
     bool lockCalibrationForImage(const cv::Size& image_size);
 
     void imageCallback(const sensor_msgs::ImageConstPtr& msg);
+    void publishProcessedImageAck();
 
     void publishCurrentPose(const std::shared_ptr<Frame>& frame);
     
@@ -173,10 +176,14 @@ private:
     ros::Subscriber image_sub_;
     ros::Subscriber camera_info_sub_;
     ros::Publisher pose_pub_;
+    ros::Publisher processed_image_pub_;
     std::ofstream trajectory_output_;
 
     std::string camera_topic_;
     std::string camera_info_topic_;
+    std::string processed_image_topic_;
+    int image_queue_size_{10};
+    std::uint64_t processed_image_count_{0};
 
     std::string trajectory_output_path_;
     std::string trajectory_format_;
@@ -203,6 +210,11 @@ private:
     std::shared_ptr<Frame> last_tracked_frame_;
     std::weak_ptr<Frame> tracking_reference_keyframe_;
 
+    // ORB-SLAM2 logic reference: the monocular initializer retains matched
+    // image positions while its reference frame remains unchanged.
+    std::size_t initialization_match_reference_id_{std::numeric_limits<std::size_t>::max()};
+    std::vector<cv::Point2f> initialization_previous_matched_;
+
     cv::Mat motion_R_;
     cv::Mat motion_t_;
     bool has_motion_model_{false};
@@ -225,9 +237,16 @@ private:
 
     int min_keyframe_gap_{2};
     int max_keyframe_gap_{10};
+    std::size_t keyframe_decision_num_{0};
+    std::size_t keyframe_busy_rejected_num_{0};
+    std::size_t keyframe_force_insert_num_{0};
+    std::size_t keyframe_weak_insert_num_{0};
     int tmp_lost_max_frames_{5};
     double max_tracking_reproj_error_{8.0};
-    int min_tracking_inliers_{20};
+    // ORB-SLAM2's TrackLocalMap contract requires at least 30 map-point
+    // inliers for normal tracking. Keep this separate from the higher
+    // relocalization acceptance contract.
+    int min_tracking_inliers_{30};
     int min_recovery_inliers_{15};
 
     int min_recovery_seed_inliers_{10};

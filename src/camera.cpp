@@ -27,8 +27,25 @@ bool Camera::loadParams(ros::NodeHandle& nh)
 
     cv::Mat raw_k, raw_D;
 
-    if (!parseMatrix(K_data, 3, 3, raw_k) ||
-        !parseMatrix(D_data, 5, 1, raw_D))
+    if (!parseMatrix(K_data, 3, 3, raw_k))
+    {
+        is_valid_ = false;
+        return false;
+    }
+
+    // EuRoC cam0 uses the four-parameter plumb_bob model. Keep the
+    // coefficient count intact so setCalibration can validate all OpenCV
+    // distortion layouts (4, 5, 8, 12 and 14).
+    const int distortion_num = static_cast<int>(D_data.size());
+    if (distortion_num != 4 && distortion_num != 5 && distortion_num != 8 &&
+        distortion_num != 12 && distortion_num != 14)
+    {
+        ROS_ERROR("Invalid distortion coefficients size: %d", distortion_num);
+        is_valid_ = false;
+        return false;
+    }
+
+    if (!parseMatrix(D_data, distortion_num, 1, raw_D))
     {
         is_valid_ = false;
         return false;

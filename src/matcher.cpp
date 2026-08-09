@@ -93,6 +93,161 @@ std::vector<std::pair<int, int>> Matcher::matchFrames(const Frame& ref_frame, co
     return matchDescriptors(ref_frame.getDescriptors(), cur_frame.getDescriptors());
 }
 
+std::vector<std::pair<int, int>> Matcher::matchFramesForInitialization(
+    const Frame& ref_frame,
+    const Frame& cur_frame,
+    std::vector<cv::Point2f>& previous_matched,
+    int window_size) const
+{
+    std::vector<std::pair<int, int>> match_indices;
+
+    if (!ref_frame.hasFeatures() || !cur_frame.hasFeatures() || window_size <= 0)
+        return match_indices;
+
+    const std::vector<cv::KeyPoint>& ref_keypoints = ref_frame.getKeypoints();
+    const std::vector<cv::KeyPoint>& cur_keypoints = cur_frame.getKeypoints();
+    const cv::Mat& ref_descriptors = ref_frame.getDescriptors();
+    const cv::Mat& cur_descriptors = cur_frame.getDescriptors();
+
+    if (ref_keypoints.size() != static_cast<std::size_t>(ref_descriptors.rows) ||
+        cur_keypoints.size() != static_cast<std::size_t>(cur_descriptors.rows))
+    {
+        return match_indices;
+    }
+
+    if (previous_matched.size() != ref_keypoints.size())
+    {
+        previous_matched.clear();
+        previous_matched.reserve(ref_keypoints.size());
+        for (const cv::KeyPoint& keypoint : ref_keypoints)
+            previous_matched.push_back(keypoint.pt);
+    }
+
+    // ORB-SLAM2 logic reference: SearchForInitialization uses TH_LOW=50 and
+    // a 0.9 nearest-neighbour ratio, independently of normal tracking's
+    // descriptor acceptance policy.
+    constexpr int kInitializationMaxHammingDistance = 50;
+    constexpr float kInitializationRatio = 0.9f;
+
+    std::vector<int> matched_ref_for_cur(cur_keypoints.size(), -1);
+    std::vector<int> matched_distance_for_cur(cur_keypoints.size(),
+                                              std::numeric_limits<int>::max());
+    std::array<std::vector<int>, kRotationHistBinNum> rotation_hist;
+    for (auto& bin : rotation_hist)
+        bin.reserve(16);
+
+    for (int ref_idx = 0; ref_idx < ref_descriptors.rows; ++ref_idx)
+    {
+        const cv::KeyPoint& ref_keypoint = ref_keypoints[ref_idx];
+        const int level = ref_keypoint.octave;
+        if (level != 0)
+            continue;
+
+        const std::vector<int> candidate_indices = cur_frame.getFeatureIndicesInArea(
+            previous_matched[ref_idx], static_cast<float>(window_size), level, level);
+        if (candidate_indices.empty())
+            continue;
+
+        int best_distance = std::numeric_limits<int>::max();
+        int second_best_distance = std::numeric_limits<int>::max();
+        int best_cur_idx = -1;
+
+        for (const int cur_idx : candidate_indices)
+        {
+            if (cur_idx < 0 || cur_idx >= cur_descriptors.rows)
+            {
+                continue;
+            }
+
+            const int distance = static_cast<int>(cv::norm(
+                ref_descriptors.row(ref_idx), cur_descriptors.row(cur_idx), cv::NORM_HAMMING));
+
+            if (matched_distance_for_cur[cur_idx] <= distance)
+                continue;
+
+            if (distance < best_distance)
+            {
+                second_best_distance = best_distance;
+                best_distance = distance;
+                best_cur_idx = cur_idx;
+            }
+            else if (distance < second_best_distance)
+            {
+                second_best_distance = distance;
+            }
+        }
+
+        if (best_cur_idx < 0 || best_distance > kInitializationMaxHammingDistance ||
+            best_distance >= kInitializationRatio * second_best_distance)
+        {
+            continue;
+        }
+
+        const int previous_ref_idx = matched_ref_for_cur[best_cur_idx];
+        if (previous_ref_idx >= 0)
+        {
+            for (int previous_cur_idx = 0;
+                 previous_cur_idx < static_cast<int>(matched_ref_for_cur.size());
+                 ++previous_cur_idx)
+            {
+                if (matched_ref_for_cur[previous_cur_idx] == previous_ref_idx)
+                {
+                    matched_ref_for_cur[previous_cur_idx] = -1;
+                    matched_distance_for_cur[previous_cur_idx] =
+                        std::numeric_limits<int>::max();
+                    break;
+                }
+            }
+
+            for (auto& bin : rotation_hist)
+            {
+                bin.erase(std::remove(bin.begin(), bin.end(), previous_ref_idx), bin.end());
+            }
+        }
+
+        matched_ref_for_cur[best_cur_idx] = ref_idx;
+        matched_distance_for_cur[best_cur_idx] = best_distance;
+
+        float angle_diff = ref_keypoint.angle - cur_keypoints[best_cur_idx].angle;
+        if (angle_diff < 0.0f)
+            angle_diff += 360.0f;
+
+        rotation_hist[computeRotationBin(angle_diff)].push_back(ref_idx);
+    }
+
+    int best_bin_1 = -1;
+    int best_bin_2 = -1;
+    int best_bin_3 = -1;
+    computeTopThreeBins(rotation_hist, best_bin_1, best_bin_2, best_bin_3);
+
+    std::vector<bool> keep_reference(ref_keypoints.size(), false);
+    const auto mark_bin = [&rotation_hist, &keep_reference](int bin_idx)
+    {
+        if (bin_idx < 0)
+            return;
+
+        for (const int ref_idx : rotation_hist[bin_idx])
+            keep_reference[ref_idx] = true;
+    };
+
+    mark_bin(best_bin_1);
+    mark_bin(best_bin_2);
+    mark_bin(best_bin_3);
+
+    match_indices.reserve(ref_keypoints.size());
+    for (int cur_idx = 0; cur_idx < static_cast<int>(matched_ref_for_cur.size()); ++cur_idx)
+    {
+        const int ref_idx = matched_ref_for_cur[cur_idx];
+        if (ref_idx < 0 || !keep_reference[ref_idx])
+            continue;
+
+        match_indices.emplace_back(ref_idx, cur_idx);
+        previous_matched[ref_idx] = cur_keypoints[cur_idx].pt;
+    }
+
+    return match_indices;
+}
+
 std::vector<std::pair<int, int>> Matcher::matchDescriptors(const cv::Mat& query_descriptors, const cv::Mat& train_descriptors) const
 {
     std::vector<std::pair<int, int>> match_indices;
