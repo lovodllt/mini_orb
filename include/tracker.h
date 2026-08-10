@@ -2,8 +2,7 @@
 #define MINI_ORB_SLAM_INCLUDE_TRACKER_H_
 
 #include <memory>
-#include <unordered_set>
-
+#include <unordered_set> 
 #include "camera.h"
 #include "common.h"
 #include "feature.h"
@@ -28,7 +27,8 @@ public:
     PnPResult estimatePoseByPnP(const InitializationResult& init_result) const;
 
     PnPResult trackFrameByMap(const std::shared_ptr<Map>& map, 
-                              const std::shared_ptr<Frame>& cur_frame) const;
+                              const std::shared_ptr<Frame>& cur_frame,
+                              bool map_mutex_held = false) const;
 
     PnPResult trackFrameByProjectionOnly(const std::vector<std::shared_ptr<MapPoint>>& map_points,
                                          const std::shared_ptr<Frame>& cur_frame,

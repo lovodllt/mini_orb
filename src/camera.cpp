@@ -243,4 +243,15 @@ Eigen::Vector2d Camera::Camera2Pixel(const Eigen::Vector3d& pc) const
     return pixel;
 }
 
+bool Camera::projectCameraPoint(double x, double y, double z,
+                                double& u, double& v) const
+{
+    if (!is_valid_ || z <= 0.0)
+        return false;
+
+    u = fx_ * x / z + cx_;
+    v = fy_ * y / z + cy_;
+    return std::isfinite(u) && std::isfinite(v);
+}
+
 } // namespace mini_orb_slam

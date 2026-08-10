@@ -41,11 +41,17 @@ class Frontend
 {
 public:
     explicit Frontend(ros::NodeHandle& nh);
+    ~Frontend();
 
     bool init();
+    // Uses the same frontend processing path as imageCallback(), but does not
+    // create ROS image transport endpoints. Intended for offline benchmarks.
+    bool initOffline();
     void run();
+    void processImage(const cv::Mat& image, double timestamp);
 
 private:
+    bool initImpl(bool enable_ros_transport);
     bool openTrajectoryOutputFile(bool truncate);
 
     bool initializeFromRefAndCur(const std::shared_ptr<Frame>& ref_frame, 
@@ -113,8 +119,13 @@ private:
 
     void refreshMapAfterPoseGraphOptimization(const std::shared_ptr<Map>& map);
 
+    void consumeLocalMappingResult(const LocalMappingOutput& output);
     void drainLocalMappingResults();
     void drainLoopClosingResults();
+    bool submitKeyframeWithCommitBarrier(const std::shared_ptr<Map>& map,
+                                         const std::shared_ptr<Frame>& cur_frame,
+                                         const PnPResult& tracking_seed,
+                                         const TrackingResult& tracking_result);
     
     void resetMotionModel();
 
@@ -239,6 +250,7 @@ private:
     int max_keyframe_gap_{10};
     std::size_t keyframe_decision_num_{0};
     std::size_t keyframe_busy_rejected_num_{0};
+    std::size_t keyframe_commit_barrier_num_{0};
     std::size_t keyframe_force_insert_num_{0};
     std::size_t keyframe_weak_insert_num_{0};
     int tmp_lost_max_frames_{5};

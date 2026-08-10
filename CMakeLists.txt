@@ -70,6 +70,36 @@ target_link_libraries(mini_orb_node
   g2o::solver_eigen
 )
 
+add_executable(mini_orb_kitti_offline
+  src/mini_orb_kitti_offline.cpp
+  src/frontend.cpp
+  src/initializer.cpp
+  src/tracker.cpp
+  src/camera.cpp
+  src/frame.cpp
+  src/orb_extractor.cpp
+  src/matcher.cpp
+  src/pose_optimizer.cpp
+  src/local_mapper.cpp
+  src/map_point.cpp
+  src/map.cpp
+  src/bow_vocabulary.cpp
+  src/keyframe_database.cpp
+  src/loop_closer.cpp
+)
+
+target_link_libraries(mini_orb_kitti_offline
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBS}
+  Eigen3::Eigen
+  Sophus::Sophus
+  DBoW2
+  g2o::core
+  g2o::types_sba
+  g2o::types_sim3
+  g2o::solver_eigen
+)
+
 add_executable(kitti_mono_publisher
   src/kitti_mono_publisher.cpp
 )
@@ -88,4 +118,19 @@ target_link_libraries(camera_distortion_params_check
   ${catkin_LIBRARIES}
   ${OpenCV_LIBS}
   Eigen3::Eigen
+)
+
+add_executable(pose_graph_refresh_check
+  test/pose_graph_refresh_test.cpp
+  src/bow_vocabulary.cpp
+  src/frame.cpp
+  src/map.cpp
+  src/map_point.cpp
+)
+
+target_link_libraries(pose_graph_refresh_check
+  ${catkin_LIBRARIES}
+  ${OpenCV_LIBS}
+  Eigen3::Eigen
+  DBoW2
 )

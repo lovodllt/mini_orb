@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <vector>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <opencv4/opencv2/core.hpp>
 
@@ -53,6 +55,8 @@ public:
         map_points_.clear();
         keyframes_.clear();
         pose_graph_constraints_.clear();
+        pose_graph_constraint_indices_.clear();
+        incident_constraint_indices_.clear();
         next_map_point_id_.store(0, std::memory_order_relaxed);
         markModified();
     }
@@ -74,6 +78,11 @@ public:
     void addKeyframe(const std::shared_ptr<Frame>& keyframe);
 
     void recordCovisibilityConstraints(const std::shared_ptr<Frame>& keyframe);
+
+    // Reconcile a Local BA-updated covisibility neighborhood. Invalid edges
+    // are removed before current valid connections are recorded.
+    void reconcileCovisibilityConstraints(
+        const std::vector<std::shared_ptr<Frame>>& keyframes);
 
     void removeBadMapPoints()
     {
@@ -100,7 +109,34 @@ public:
         // Retire the frame before rebuilding graph state. This prevents stale
         // keyframe observations from surviving in MapPoint/Frame covisibility
         // queries while external shared_ptr users still hold the Frame.
+        // Only keyframes incident to the removed observations can have their
+        // covisibility counts changed; keep that set for targeted refresh.
+        std::unordered_map<std::size_t, std::shared_ptr<Frame>> affected_keyframes;
+        const auto remember_affected =
+            [&affected_keyframes, &keyframe](const std::shared_ptr<Frame>& candidate)
+        {
+            if (candidate == nullptr || candidate == keyframe || !candidate->isKeyframe())
+                return;
+            affected_keyframes.emplace(candidate->getId(), candidate);
+        };
+
+        for (const auto& neighbor : keyframe->getConnectedKeyframes())
+            remember_affected(neighbor);
+
+        // Include graph neighbors even if the Frame-side covisibility cache is
+        // stale. This retains the cleanup behavior of the old full refresh.
+        for (const auto& constraint : pose_graph_constraints_)
+        {
+            const std::shared_ptr<Frame> from_keyframe = constraint.from_keyframe.lock();
+            const std::shared_ptr<Frame> to_keyframe = constraint.to_keyframe.lock();
+            if (from_keyframe == keyframe)
+                remember_affected(to_keyframe);
+            else if (to_keyframe == keyframe)
+                remember_affected(from_keyframe);
+        }
+
         std::vector<std::shared_ptr<MapPoint>> touched_map_points;
+        std::unordered_set<std::size_t> touched_map_point_ids;
         for (const auto& feature : keyframe->getFeatures())
         {
             if (feature == nullptr)
@@ -110,9 +146,13 @@ public:
             if (map_point == nullptr)
                 continue;
 
+            for (const auto& observation_frame : map_point->getKeyframeObservationFrames())
+                remember_affected(observation_frame);
+
             feature->setMapPoint(nullptr);
             map_point->removeObservation(feature);
-            touched_map_points.push_back(map_point);
+            if (touched_map_point_ids.insert(map_point->getId()).second)
+                touched_map_points.push_back(map_point);
         }
 
         keyframe->setKeyframe(false);
@@ -136,10 +176,11 @@ public:
             }
         }
 
-        for (const auto& surviving_keyframe : keyframes_)
+        for (const auto& affected_entry : affected_keyframes)
         {
-            if (surviving_keyframe != nullptr)
-                surviving_keyframe->updateConnections();
+            const std::shared_ptr<Frame>& affected_keyframe = affected_entry.second;
+            if (affected_keyframe != nullptr && affected_keyframe->isKeyframe())
+                affected_keyframe->updateConnections();
         }
 
         pose_graph_constraints_.erase(
@@ -155,6 +196,7 @@ public:
                            from_keyframe == keyframe || to_keyframe == keyframe;
                 }),
             pose_graph_constraints_.end());
+        rebuildPoseGraphConstraintIndexes();
 
         markModified();
     }
@@ -182,6 +224,13 @@ public:
     std::vector<std::shared_ptr<MapPoint>> copyMapPoints() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        return map_points_;
+    }
+
+    // The caller must already hold getMutex(). This avoids self-deadlock in
+    // compound map transactions that need a stable point snapshot.
+    std::vector<std::shared_ptr<MapPoint>> copyMapPointsLocked() const
+    {
         return map_points_;
     }
 
@@ -226,10 +275,52 @@ public:
     // keyframe poses. Verified loop measurements are intentionally preserved.
     std::size_t refreshPoseGraphMeasurements();
 
+    // Refresh only constraints incident to the supplied keyframes. This is
+    // used by Local BA after a transactional pose commit; loop closing keeps
+    // the full-map overload for its global graph hand-off.
+    std::size_t refreshPoseGraphMeasurements(
+        const std::vector<std::shared_ptr<Frame>>& dirty_keyframes);
+
 private:
+    struct PoseGraphConstraintKey
+    {
+        std::size_t first_keyframe_id{0};
+        std::size_t second_keyframe_id{0};
+        PoseGraphConstraintKind kind{PoseGraphConstraintKind::SEQUENTIAL};
+
+        bool operator==(const PoseGraphConstraintKey& other) const
+        {
+            return first_keyframe_id == other.first_keyframe_id &&
+                   second_keyframe_id == other.second_keyframe_id &&
+                   kind == other.kind;
+        }
+    };
+
+    struct PoseGraphConstraintKeyHash
+    {
+        std::size_t operator()(const PoseGraphConstraintKey& key) const
+        {
+            const std::size_t h1 = std::hash<std::size_t>{}(key.first_keyframe_id);
+            const std::size_t h2 = std::hash<std::size_t>{}(key.second_keyframe_id);
+            const std::size_t h3 = std::hash<int>{}(static_cast<int>(key.kind));
+            return h1 ^ (h2 << 1) ^ (h3 << 2);
+        }
+    };
+
+    static PoseGraphConstraintKey makePoseGraphConstraintKey(
+        const std::shared_ptr<Frame>& from_keyframe,
+        const std::shared_ptr<Frame>& to_keyframe,
+        PoseGraphConstraintKind kind);
+    void rebuildPoseGraphConstraintIndexes();
+    bool removeExpiredPoseGraphConstraints();
+
     std::vector<std::shared_ptr<MapPoint>> map_points_;
     std::vector<std::shared_ptr<Frame>> keyframes_;
     std::vector<PoseGraphConstraint> pose_graph_constraints_;
+    std::unordered_map<PoseGraphConstraintKey, std::size_t,
+                       PoseGraphConstraintKeyHash> pose_graph_constraint_indices_;
+    std::unordered_map<std::size_t, std::unordered_set<std::size_t>>
+        incident_constraint_indices_;
     std::atomic<std::size_t> next_map_point_id_{0};
     std::atomic<std::size_t> version_{0};
 

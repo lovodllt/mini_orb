@@ -10,6 +10,10 @@
 
 #include "local_mapper.h"
 
+#include "bow_vocabulary.h"
+#include "keyframe_database.h"
+#include "loop_closer.h"
+
 namespace mini_orb_slam
 {
 
@@ -170,8 +174,7 @@ bool getMapPointDescriptor(const std::shared_ptr<MapPoint>& map_point,
     if (map_point == nullptr || map_point->isBad())
         return false;
 
-    descriptor = map_point->getRepresentativeDescriptor();
-    if (!descriptor.empty())
+    if (map_point->getRepresentativeDescriptorView(descriptor))
         return true;
 
     return getFeatureDescriptor(map_point->selectRefFeatureCandidate(), descriptor);
@@ -294,8 +297,13 @@ std::vector<std::pair<int, int>> collectTriangulationMatches(
         return candidate_matches;
     }
 
-    const std::vector<std::pair<int, int>> raw_matches = 
-        matcher.matchFrames(*ref_keyframe, *cur_keyframe);
+    // Preserve the accepted R145 candidate policy: triangulation starts from
+    // the global ratio-filtered BF matches, then applies occupancy, epipolar,
+    // and orientation tests below. The distance is carried through from BF so
+    // this second-stage filtering does not repeat descriptor comparisons.
+    const std::vector<cv::DMatch> raw_matches =
+        matcher.matchDescriptorsWithDistance(ref_keyframe->getDescriptors(),
+                                             cur_keyframe->getDescriptors());
     if (diagnostics != nullptr)
         diagnostics->raw_matches = raw_matches.size();
     if (raw_matches.empty())
@@ -303,23 +311,23 @@ std::vector<std::pair<int, int>> collectTriangulationMatches(
 
     const std::vector<std::shared_ptr<Feature>>& ref_features = ref_keyframe->getFeatures();
     const std::vector<std::shared_ptr<Feature>>& cur_features = cur_keyframe->getFeatures();
-    const std::vector<cv::KeyPoint> ref_keypoints = ref_keyframe->getKeypoints();
-    const std::vector<cv::KeyPoint> cur_keypoints = cur_keyframe->getKeypoints();
-    const cv::Mat& ref_descriptor = ref_keyframe->getDescriptors();
-    const cv::Mat& cur_descroptor = cur_keyframe->getDescriptors();
+    const std::vector<cv::KeyPoint>& ref_keypoints = ref_keyframe->getKeypoints();
+    const std::vector<cv::KeyPoint>& cur_keypoints = cur_keyframe->getKeypoints();
+    const cv::Mat& ref_descriptors = ref_keyframe->getDescriptors();
+    const cv::Mat& cur_descriptors = cur_keyframe->getDescriptors();
 
     std::vector<int> best_ref_for_cur(cur_features.size(), -1);
     std::vector<int> best_dist_for_cur(cur_features.size(), std::numeric_limits<int>::max());
     std::vector<float> best_angle_diff_for_cur(cur_features.size(), -1.0f);
 
-    for (const auto& match_idx : raw_matches)
+    for (const cv::DMatch& raw_match : raw_matches)
     {
-        const int ref_idx = match_idx.first;
-        const int cur_idx = match_idx.second;
+        const int ref_idx = raw_match.queryIdx;
+        const int cur_idx = raw_match.trainIdx;
 
         if (ref_idx < 0 || ref_idx >= ref_features.size() ||
             cur_idx < 0 || cur_idx >= cur_features.size() ||
-            ref_idx >= ref_descriptor.rows || cur_idx >= cur_descroptor.rows ||
+            ref_idx >= ref_descriptors.rows || cur_idx >= cur_descriptors.rows ||
             ref_idx >= ref_keypoints.size() || cur_idx >= cur_keypoints.size())
         {
             continue;
@@ -350,10 +358,7 @@ std::vector<std::pair<int, int>> collectTriangulationMatches(
             continue;
         }
 
-        const int dist = static_cast<int>(
-            cv::norm(ref_descriptor.row(ref_idx),
-                     cur_descroptor.row(cur_idx),
-                     cv::NORM_HAMMING));
+        const int dist = cvRound(raw_match.distance);
 
         if (dist < best_dist_for_cur[cur_idx])
         {
@@ -430,7 +435,7 @@ std::vector<std::shared_ptr<MapPoint>> collectUniqueMapPointsFromKeyframe(
 
     for (const auto& feature : keyframe->getFeatures())
     {
-        if (feature == nullptr || !feature->hasMapPoint())
+        if (feature == nullptr)
             continue;
 
         const std::shared_ptr<MapPoint> map_point = feature->getMapPoint();
@@ -478,6 +483,19 @@ LocalMapper::~LocalMapper()
 {
     requestFinish();
     join();
+}
+
+void LocalMapper::setKeyframeDatabase(
+    const std::shared_ptr<BoWVocabulary>& vocabulary,
+    const std::shared_ptr<KeyframeDatabase>& database)
+{
+    bow_vocabulary_ = vocabulary;
+    keyframe_database_ = database;
+}
+
+void LocalMapper::setLoopCloser(LoopCloser* loop_closer)
+{
+    loop_closer_ = loop_closer;
 }
 
 void LocalMapper::start()
@@ -550,13 +568,12 @@ bool LocalMapper::insertKeyframe(const LocalMappingInput& input)
         if (!accept_keyframes_ || finish_requested_)
             return false;
 
-        // Keep at most one newer keyframe as a coalescing signal while BA is
-        // running. The worker will abort the stale BA and process this input.
-        if (!pending_keyframes_.empty())
+        // A transaction must be consumed by Frontend before the next keyframe
+        // is admitted, keeping map topology in source-frame order.
+        if (!pending_keyframes_.empty() || !finished_results_.empty())
             return false;
 
         pending_keyframes_.push_back(input);
-        abort_ba_ = true;
     }
 
     queue_cv_.notify_one();
@@ -580,13 +597,28 @@ bool LocalMapper::tryPopFinishedResult(LocalMappingOutput& output)
     return true;
 }
 
+bool LocalMapper::waitPopFinishedResult(LocalMappingOutput& output)
+{
+    std::unique_lock<std::mutex> lock(queue_mutex_);
+    queue_cv_.wait(lock, [this]()
+    {
+        return finish_requested_ || !finished_results_.empty() ||
+               (accept_keyframes_ && pending_keyframes_.empty() && !stop_requested_);
+    });
+
+    if (finished_results_.empty())
+        return false;
+
+    output = finished_results_.front();
+    finished_results_.pop_front();
+    return true;
+}
+
 bool LocalMapper::acceptKeyframe() const
 {
     std::lock_guard<std::mutex> lock(queue_mutex_);
-    // The frontend must consume the completed result before admitting another
-    // keyframe.  Otherwise a finished mapping transaction remains invisible to
-    // the frontend while the worker immediately accepts the next frame,
-    // creating an unbounded hand-off rate when tracking is slower than mapping.
+    // A completed transaction must be consumed before the next keyframe is
+    // admitted. This defines the synchronous accuracy-reference contract.
     return accept_keyframes_ &&
            !finish_requested_ &&
            !stop_requested_ &&
@@ -606,8 +638,22 @@ bool LocalMapper::stopRequested() const
     return stop_requested_;
 }
 
+bool LocalMapper::finishRequested() const
+{
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    return finish_requested_;
+}
+
 void LocalMapper::run()
 {
+    std::size_t processed_keyframes = 0;
+    std::size_t fusion_calls = 0;
+    std::size_t local_ba_calls = 0;
+    std::size_t keyframe_cull_calls = 0;
+    std::size_t convergence_yields = 0;
+    double total_mapping_ms = 0.0;
+    double total_ba_ms = 0.0;
+
     while (true)
     {
         LocalMappingInput input;
@@ -649,11 +695,21 @@ void LocalMapper::run()
                                            input.cur_keyframe,
                                            input.tracking_seed);
 
+        processed_keyframes++;
+        fusion_calls += output.result.fusion_called ? 1 : 0;
+        local_ba_calls += output.result.local_ba_called ? 1 : 0;
+        keyframe_cull_calls += output.result.keyframe_cull_called ? 1 : 0;
+        convergence_yields +=
+            output.result.convergence_skipped_for_pending_keyframe ? 1 : 0;
+        total_mapping_ms += output.result.total_duration_ms;
+        total_ba_ms += output.result.local_ba_duration_ms;
+
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
             finished_results_.push_back(std::move(output));
             accept_keyframes_ = true;
         }
+        queue_cv_.notify_all();
     }
 
     {
@@ -662,12 +718,24 @@ void LocalMapper::run()
         finished_ = true;
         accept_keyframes_ = false;
     }
+
+    ROS_INFO_STREAM("P2-KITTI-SCHED-R132 summary processed=" << processed_keyframes
+                    << " fusion=" << fusion_calls
+                    << " local_ba=" << local_ba_calls
+                    << " keyframe_cull=" << keyframe_cull_calls
+                    << " yielded_convergence=" << convergence_yields
+                    << " local_mapping_total_ms=" << total_mapping_ms
+                    << " local_mapping_mean_ms="
+                    << (processed_keyframes == 0 ? 0.0 : total_mapping_ms / processed_keyframes)
+                    << " local_ba_total_ms=" << total_ba_ms
+                    << " local_ba_mean_ms="
+                    << (local_ba_calls == 0 ? 0.0 : total_ba_ms / local_ba_calls));
 }
 
 LocalMappingResult LocalMapper::processNewKeyframe(const std::shared_ptr<Map>& map, 
                                                    const std::shared_ptr<Frame>& ref_keyframe, 
                                                    const std::shared_ptr<Frame>& cur_keyframe,
-                                                   const PnPResult& tracking_seed) const
+                                                   const PnPResult& tracking_seed)
 {
     LocalMappingResult result;
     const auto processing_start = std::chrono::steady_clock::now();
@@ -702,6 +770,8 @@ LocalMappingResult LocalMapper::processNewKeyframe(const std::shared_ptr<Map>& m
     double map_point_cull_ms = 0.0;
     double triangulation_ms = 0.0;
     double fusion_and_graph_ms = 0.0;
+    double fusion_pre_graph_ms = 0.0;
+    double fusion_reference_graph_ms = 0.0;
     double keyframe_cull_ms = 0.0;
     std::size_t fused_map_point_num = 0;
     {
@@ -736,81 +806,129 @@ LocalMappingResult LocalMapper::processNewKeyframe(const std::shared_ptr<Map>& m
             growMapByKeyFrames(map,
                                ref_keyframe,
                                cur_keyframe,
-                               current_local_mapping_generation);
+                               current_local_mapping_generation,
+                               &result);
         triangulation_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - triangulation_start).count();
 
-        const auto fusion_and_graph_start = std::chrono::steady_clock::now();
-        updateCovisibilityGraph(map, cur_keyframe);
-        fused_map_point_num = searchInNeighbors(map, cur_keyframe);
-
-        updateCovisibilityGraph(map, cur_keyframe);
-        if (ref_keyframe != cur_keyframe)
-            updateCovisibilityGraph(map, ref_keyframe);
-        fusion_and_graph_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - fusion_and_graph_start).count();
-
-        constexpr std::size_t kMinKeyframesForLocalBA = 3;
-        result.local_ba_called = (pose_optimizer_ != nullptr) &&
-                                 (map->getKeyframeNum() > kMinKeyframesForLocalBA);
     }
+
     LocalBAResult local_ba_result;
-    bool pending_keyframe_before_ba = false;
-    if (result.local_ba_called)
+    if (!hasPendingKeyframe())
     {
         {
+            const auto map_lock_start = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> map_lock(map->getMutex());
+            map_lock_wait_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - map_lock_start).count();
+            const auto fusion_and_graph_start = std::chrono::steady_clock::now();
+            const auto pre_graph_start = std::chrono::steady_clock::now();
+            updateCovisibilityGraph(map, cur_keyframe);
+            fusion_pre_graph_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - pre_graph_start).count();
+            fused_map_point_num = searchInNeighbors(map, cur_keyframe, &result);
+
+            // searchInNeighbors() refreshes cur_keyframe after it changes
+            // feature associations.  No intervening mutation requires a
+            // second full rebuild for the same frame.
+            if (ref_keyframe != cur_keyframe)
+            {
+                const auto reference_graph_start = std::chrono::steady_clock::now();
+                updateCovisibilityGraph(map, ref_keyframe);
+                fusion_reference_graph_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - reference_graph_start).count();
+            }
+            fusion_and_graph_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - fusion_and_graph_start).count();
+            result.fusion_called = true;
+        }
+
+        // Do not start BA or keyframe culling once a newer keyframe has been
+        // admitted during Fusion.  This is the ORB2 queue-empty rule, applied
+        // only at a synchronization-safe phase boundary.
+        bool run_convergence = false;
+        {
             std::lock_guard<std::mutex> queue_lock(queue_mutex_);
-            abort_ba_ = false;
-            // ORB-SLAM2 logic reference: Tracking cannot enqueue a keyframe
-            // while LocalMapping owns the active transaction. The abort flag
-            // remains available for stop/loop requests and race-safe callers.
-            pending_keyframe_before_ba = !pending_keyframes_.empty();
+            if (!pending_keyframes_.empty())
+            {
+                result.convergence_skipped_for_pending_keyframe = true;
+            }
+            else if (!stop_requested_ && !finish_requested_)
+            {
+                // A BA/cull transaction mutates map state.  Close admission
+                // before it begins so an admitted seed cannot span that
+                // mutation.  We intentionally do not interrupt g2o mid-solve.
+                accept_keyframes_ = false;
+                run_convergence = true;
+            }
         }
 
-        if (pending_keyframe_before_ba)
+        if (run_convergence)
         {
-            // ORB-SLAM2 logic reference: Local BA is opportunistic and is
-            // skipped while newer keyframes are waiting to be integrated.
-            result.local_ba_called = false;
-            local_ba_result.rejection_reason = "pending_keyframe";
-        }
-        else
-        {
-            const auto local_ba_start = std::chrono::steady_clock::now();
-            local_ba_result = pose_optimizer_->optimizeLocalMap(map,
-                                                                cur_keyframe,
-                                                                tracking_seed,
-                                                                &abort_ba_);
-            result.local_ba_duration_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - local_ba_start).count();
-        }
+            {
+                const auto map_lock_start = std::chrono::steady_clock::now();
+                std::lock_guard<std::mutex> map_lock(map->getMutex());
+                map_lock_wait_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - map_lock_start).count();
+                constexpr std::size_t kMinKeyframesForLocalBA = 3;
+                result.local_ba_called = (pose_optimizer_ != nullptr) &&
+                                         (map->getKeyframeNum() > kMinKeyframesForLocalBA);
+            }
 
-        std::lock_guard<std::mutex> queue_lock(queue_mutex_);
-        accept_keyframes_ = false;
+            if (result.local_ba_called)
+            {
+                const auto local_ba_start = std::chrono::steady_clock::now();
+                local_ba_result = pose_optimizer_->optimizeLocalMap(map,
+                                                                    cur_keyframe,
+                                                                    tracking_seed);
+                result.local_ba_duration_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - local_ba_start).count();
+            }
+
+            // ORB-SLAM2 runs KeyFrameCulling after the Local BA opportunity.
+            // The candidate BA commit is transactional, so rejected BA poses
+            // cannot leak into this decision.
+            const auto map_lock_start = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> map_lock(map->getMutex());
+            map_lock_wait_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - map_lock_start).count();
+            const auto keyframe_cull_start = std::chrono::steady_clock::now();
+            result.culled_keyframe_num = cullKeyframes(map, cur_keyframe, &result);
+            keyframe_cull_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - keyframe_cull_start).count();
+            result.keyframe_cull_called = true;
+            result.active_keyframe_num = map->getKeyframeNum();
+            result.active_map_point_num = map->getMapPointNum();
+        }
+    }
+    else
+    {
+        result.convergence_skipped_for_pending_keyframe = true;
+    }
+
+    if (!result.keyframe_cull_called)
+    {
+        const auto map_lock_start = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> map_lock(map->getMutex());
+        map_lock_wait_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - map_lock_start).count();
+        result.active_keyframe_num = map->getKeyframeNum();
+        result.active_map_point_num = map->getMapPointNum();
     }
 
     result.local_ba_solver_success = local_ba_result.solver_success;
     result.local_ba_success = local_ba_result.accepted;
     result.local_ba_rejected = local_ba_result.solver_success && !local_ba_result.accepted;
-
     result.local_ba_edge_num = local_ba_result.edge_num;
     result.local_ba_rejected_edge_num = local_ba_result.rejected_edge_num;
     result.local_ba_seed_reproj_error = local_ba_result.seed_reproj_error;
     result.local_ba_candidate_seed_reproj_error = local_ba_result.candidate_seed_reproj_error;
     result.local_ba_rejection_reason = local_ba_result.rejection_reason;
 
-    // ORB-SLAM2 logic reference: KeyFrameCulling runs after the local BA
-    // opportunity, including an aborted solve. The candidate BA path is
-    // transactional, so a rejected candidate has not modified the official
-    // poses, points, or observations used by this culling decision.
-    const auto map_lock_start = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> map_lock(map->getMutex());
-    map_lock_wait_ms += std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - map_lock_start).count();
-    const auto keyframe_cull_start = std::chrono::steady_clock::now();
-    result.culled_keyframe_num = cullKeyframes(map, cur_keyframe);
-    keyframe_cull_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - keyframe_cull_start).count();
+    // ORB-SLAM2 logic reference: LocalMapping makes the committed keyframe
+    // discoverable only after its map transaction is complete. Frontend then
+    // consumes statistics without owning any map-topology hand-off work.
+    handOffCommittedKeyframe(map, cur_keyframe, result);
 
     result.success = (result.new_map_point_num > 0) ||
                      (fused_map_point_num > 0) ||
@@ -821,6 +939,14 @@ LocalMappingResult LocalMapper::processNewKeyframe(const std::shared_ptr<Map>& m
     const auto processing_end = std::chrono::steady_clock::now();
     const double processing_ms = std::chrono::duration<double, std::milli>(
         processing_end - processing_start).count();
+    result.total_duration_ms = processing_ms;
+    result.keyframe_commit_duration_ms = keyframe_commit_ms;
+    result.map_point_cull_duration_ms = map_point_cull_ms;
+    result.triangulation_duration_ms = triangulation_ms;
+    result.fusion_duration_ms = fusion_and_graph_ms;
+    result.fusion_pre_graph_duration_ms = fusion_pre_graph_ms;
+    result.fusion_reference_graph_duration_ms = fusion_reference_graph_ms;
+    result.keyframe_cull_duration_ms = keyframe_cull_ms;
     ROS_INFO_STREAM_THROTTLE(1.0,
         "P2-EUROC-PERF-R21 local_mapping keyframe=" << cur_keyframe->getId()
         << " map_lock_wait_ms=" << map_lock_wait_ms
@@ -836,8 +962,101 @@ LocalMappingResult LocalMapper::processNewKeyframe(const std::shared_ptr<Map>& m
         << " fusion_and_graph_ms=" << fusion_and_graph_ms
         << " ba_ms=" << result.local_ba_duration_ms
         << " keyframe_cull_ms=" << keyframe_cull_ms);
+    ROS_INFO_STREAM(
+        "P2-KITTI-PERF-R143 fusion_phases keyframe=" << cur_keyframe->getId()
+        << " pre_graph_ms=" << fusion_pre_graph_ms
+        << " context_ms=" << result.fusion_context_duration_ms
+        << " forward_ms=" << result.fusion_forward_duration_ms
+        << " reverse_ms=" << result.fusion_reverse_duration_ms
+        << " post_graph_ms=" << result.fusion_post_graph_duration_ms
+        << " reference_graph_ms=" << fusion_reference_graph_ms
+        << " total_ms=" << fusion_and_graph_ms);
+    ROS_INFO_STREAM(
+        "P2-KITTI-PERF-R146 cull_phases keyframe=" << cur_keyframe->getId()
+        << " candidate_collection_ms="
+        << result.keyframe_cull_candidate_collection_duration_ms
+        << " evaluation_ms=" << result.keyframe_cull_evaluation_duration_ms
+        << " removal_ms=" << result.keyframe_cull_removal_duration_ms
+        << " total_ms=" << keyframe_cull_ms);
+    ROS_INFO_STREAM_THROTTLE(1.0,
+        "P2-KITTI-PERF-R140 local_mapping_work keyframe=" << cur_keyframe->getId()
+        << " tri_partners=" << result.triangulation_partner_num
+        << " tri_pairs=" << result.triangulation_pair_num
+        << " tri_candidates=" << result.triangulation_candidate_match_num
+        << " tri_svd=" << result.triangulation_svd_num
+        << " tri_valid_points=" << result.triangulation_valid_point_num
+        << " fusion_targets=" << result.fusion_target_keyframe_num
+        << " fusion_sources=" << result.fusion_source_map_point_num
+        << " fusion_projection_attempts=" << result.fusion_projection_attempt_num
+        << " fusion_projection_valid=" << result.fusion_projection_valid_num
+        << " fusion_descriptor_queries=" << result.fusion_descriptor_query_num
+        << " fusion_feature_candidates=" << result.fusion_feature_candidate_num
+        << " fusion_descriptor_comparisons=" << result.fusion_descriptor_comparison_num
+        << " cull_candidates=" << result.keyframe_cull_candidate_num
+        << " cull_features=" << result.keyframe_cull_feature_num
+        << " cull_observations=" << result.keyframe_cull_observation_num);
+    ROS_INFO_STREAM(
+        "P2-KITTI-PERF-R148 triangulation_phases keyframe=" << cur_keyframe->getId()
+        << " match_ms=" << result.triangulation_match_duration_ms
+        << " geometry_ms=" << result.triangulation_geometry_duration_ms
+        << " commit_ms=" << result.triangulation_commit_duration_ms
+        << " total_ms=" << triangulation_ms
+        << " pairs=" << result.triangulation_pair_num
+        << " candidates=" << result.triangulation_candidate_match_num
+        << " valid_points=" << result.triangulation_valid_point_num
+        << " created_points=" << result.new_map_point_num);
+    ROS_INFO_STREAM(
+        "P2-KITTI-PERF-R150 triangulation_match_policy keyframe=" << cur_keyframe->getId()
+        << " global_bf=1 distance_reuse=1");
+    ROS_INFO_STREAM_THROTTLE(1.0,
+        "P2-KITTI-PERF-R99 local_ba_profile keyframe=" << cur_keyframe->getId()
+        << " local_kf=" << local_ba_result.local_keyframe_num
+        << " fixed_kf=" << local_ba_result.fixed_keyframe_num
+        << " local_mp=" << local_ba_result.local_map_point_num
+        << " observations=" << local_ba_result.observation_num
+        << " mp_ba_edges_2=" << local_ba_result.map_points_with_2_ba_edges
+        << " mp_ba_edges_3=" << local_ba_result.map_points_with_3_ba_edges
+        << " mp_ba_edges_4plus="
+        << local_ba_result.map_points_with_4_or_more_ba_edges
+        << " edges=" << local_ba_result.edge_num
+        << " context_ms=" << local_ba_result.context_build_ms
+        << " graph_ms=" << local_ba_result.graph_build_ms
+        << " solve_ms=" << local_ba_result.solve_ms
+        << " validation_ms=" << local_ba_result.validation_ms
+        << " view_stats_ms=" << local_ba_result.view_statistics_ms
+        << " descriptor_refresh_ms=" << local_ba_result.descriptor_refresh_ms
+        << " descriptor_refresh_num=" << local_ba_result.descriptor_refresh_num
+        << " commit_ms=" << local_ba_result.commit_ms
+        << " accepted=" << (local_ba_result.accepted ? 1 : 0)
+        << " reason=" << local_ba_result.rejection_reason);
 
     return result;
+}
+
+void LocalMapper::handOffCommittedKeyframe(
+    const std::shared_ptr<Map>& map,
+    const std::shared_ptr<Frame>& cur_keyframe,
+    LocalMappingResult& result) const
+{
+    if (map == nullptr || cur_keyframe == nullptr || !cur_keyframe->isKeyframe())
+        return;
+
+    if (keyframe_database_ != nullptr)
+    {
+        if (!cur_keyframe->hasBoW() && bow_vocabulary_ != nullptr)
+            cur_keyframe->computeBoW(bow_vocabulary_);
+
+        result.keyframe_database_registered =
+            keyframe_database_->addKeyframe(cur_keyframe);
+    }
+
+    if (loop_closer_ != nullptr)
+    {
+        LoopClosingInput input;
+        input.map = map;
+        input.cur_keyframe = cur_keyframe;
+        result.loop_keyframe_queued = loop_closer_->insertKeyframe(input);
+    }
 }
 
 void LocalMapper::processCurrentKeyframeMapPoints(const std::shared_ptr<Frame>& keyframe) const
@@ -1077,13 +1296,17 @@ std::vector<std::shared_ptr<Frame>> LocalMapper::collectTriangulationKeyframes(
 std::size_t LocalMapper::growMapByKeyFrames(const std::shared_ptr<Map>& map, 
                                             const std::shared_ptr<Frame>& ref_keyframe, 
                                             const std::shared_ptr<Frame>& cur_keyframe,
-                                            std::size_t current_local_mapping_generation) const
+                                            std::size_t current_local_mapping_generation,
+                                            LocalMappingResult* result) const
 {   
     if (map == nullptr || ref_keyframe == nullptr || cur_keyframe == nullptr || initializer_ == nullptr)
         return 0;
 
     const std::vector<std::shared_ptr<Frame>> triangulation_keyframes = 
         collectTriangulationKeyframes(ref_keyframe, cur_keyframe);
+
+    if (result != nullptr)
+        result->triangulation_partner_num += triangulation_keyframes.size();
 
     std::size_t created_map_points_num = 0;
 
@@ -1092,7 +1315,8 @@ std::size_t LocalMapper::growMapByKeyFrames(const std::shared_ptr<Map>& map,
         created_map_points_num += growMapByKeyFramePair(map, 
                                                         neighbpr_keyframe, 
                                                         cur_keyframe, 
-                                                        current_local_mapping_generation);
+                                                        current_local_mapping_generation,
+                                                        result);
     }
 
     return created_map_points_num;
@@ -1101,10 +1325,14 @@ std::size_t LocalMapper::growMapByKeyFrames(const std::shared_ptr<Map>& map,
 std::size_t LocalMapper::growMapByKeyFramePair(const std::shared_ptr<Map>& map,
                                                const std::shared_ptr<Frame>& ref_keyframe,
                                                const std::shared_ptr<Frame>& cur_keyframe,
-                                               std::size_t current_local_mapping_generation) const
+                                               std::size_t current_local_mapping_generation,
+                                               LocalMappingResult* result) const
 {
     if (map == nullptr || ref_keyframe == nullptr || cur_keyframe == nullptr || initializer_ == nullptr)
         return 0;
+
+    if (result != nullptr)
+        result->triangulation_pair_num++;
 
     const double baseline = 
         cv::norm(ref_keyframe->getCameraCenter() - cur_keyframe->getCameraCenter());
@@ -1149,9 +1377,21 @@ std::size_t LocalMapper::growMapByKeyFramePair(const std::shared_ptr<Map>& map,
     const std::vector<std::shared_ptr<Feature>>& cur_features = cur_keyframe->getFeatures();
 
     TriangulationMatchDiagnostics match_diagnostics;
+    const auto match_start = std::chrono::steady_clock::now();
     const std::vector<std::pair<int, int>> candidate_matches = 
         collectTriangulationMatches(matcher_, ref_keyframe, cur_keyframe, F_21,
                                     scale_factor_, &match_diagnostics);
+    if (result != nullptr)
+    {
+        result->triangulation_match_duration_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - match_start).count();
+    }
+
+    if (result != nullptr)
+    {
+        result->triangulation_candidate_match_num += candidate_matches.size();
+    }
 
     if(candidate_matches.size() < 10)
     {
@@ -1169,10 +1409,23 @@ std::size_t LocalMapper::growMapByKeyFramePair(const std::shared_ptr<Map>& map,
         return 0;
     }
 
+    const auto geometry_start = std::chrono::steady_clock::now();
     const TriangulationResult triangulation_result =
         initializer_->triangulateFromMatchedFrames(ref_keyframe, 
                                                    cur_keyframe, 
                                                    candidate_matches);
+    if (result != nullptr)
+    {
+        result->triangulation_geometry_duration_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - geometry_start).count();
+    }
+
+    if (result != nullptr)
+    {
+        result->triangulation_svd_num++;
+        result->triangulation_valid_point_num += triangulation_result.points_3d.size();
+    }
 
     if (triangulation_result.points_3d.empty())
     {
@@ -1190,6 +1443,7 @@ std::size_t LocalMapper::growMapByKeyFramePair(const std::shared_ptr<Map>& map,
         return 0;
     }
 
+    const auto commit_start = std::chrono::steady_clock::now();
     std::size_t created_map_points_num = 0;
     std::size_t invalid_result_pairs = 0;
     std::size_t occupied_result_pairs = 0;
@@ -1255,6 +1509,12 @@ std::size_t LocalMapper::growMapByKeyFramePair(const std::shared_ptr<Map>& map,
 
         map->addMapPoint(map_point);
         created_map_points_num++;
+    }
+    if (result != nullptr)
+    {
+        result->triangulation_commit_duration_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - commit_start).count();
     }
 
     ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R06 pair_ref=" << ref_keyframe->getId()
@@ -1345,14 +1605,12 @@ bool LocalMapper::projectionMapPointToFrame(const std::shared_ptr<MapPoint>& map
         context.R_cw.empty() || context.t_cw.empty())
         return false;
 
-    const cv::Point3d& pw = map_point->getPos();
-    const cv::Mat point_w = (cv::Mat_<double>(3, 1) << pw.x, pw.y, pw.z);
-
-    const cv::Mat point_c = context.R_cw * point_w + context.t_cw;
-
-    const double x = point_c.at<double>(0, 0);
-    const double y = point_c.at<double>(1, 0);
-    const double z = point_c.at<double>(2, 0);
+    const cv::Point3d pw = map_point->getPos();
+    const double* R = context.R_cw.ptr<double>();
+    const double* t = context.t_cw.ptr<double>();
+    const double x = R[0] * pw.x + R[1] * pw.y + R[2] * pw.z + t[0];
+    const double y = R[3] * pw.x + R[4] * pw.y + R[5] * pw.z + t[1];
+    const double z = R[6] * pw.x + R[7] * pw.y + R[8] * pw.z + t[2];
     if (z <= 1e-6)
         return false;
 
@@ -1381,10 +1639,12 @@ bool LocalMapper::projectionMapPointToFrame(const std::shared_ptr<MapPoint>& map
             return false;
     }
 
-    const Eigen::Vector3d pc(x, y, z);
-    const Eigen::Vector2d pixel = context.camera->Camera2Pixel(pc);
+    double u = 0.0;
+    double v = 0.0;
+    if (!context.camera->projectCameraPoint(x, y, z, u, v))
+        return false;
 
-    projected_pixel = cv::Point2f(pixel(0), pixel(1));
+    projected_pixel = cv::Point2f(static_cast<float>(u), static_cast<float>(v));
     
     const int border = 10;
     if (projected_pixel.x < border || projected_pixel.x >= context.image_size.width - border ||
@@ -1403,7 +1663,9 @@ int LocalMapper::findFuseMatchInKeyframe(const std::shared_ptr<MapPoint>& map_po
                                          const cv::Mat& map_descriptor,
                                          const cv::Point2f& projected_pixel,
                                          int pred_level,
-                                         const std::unordered_set<int>& used_feature_indices) const
+                                         const std::unordered_set<int>& used_feature_indices,
+                                         std::vector<int>& candidate_indices,
+                                         LocalMappingResult* result) const
 {
     if (map_point == nullptr || keyframe == nullptr)
         return -1;
@@ -1417,8 +1679,11 @@ int LocalMapper::findFuseMatchInKeyframe(const std::shared_ptr<MapPoint>& map_po
     const int max_level = std::min(levels_num_ - 1, pred_level);
     const float search_radius = computeFusionSearchRadius(pred_level, scale_factor_, levels_num_);
 
-    const std::vector<int> candidate_indices = 
-        keyframe->getFeatureIndicesInArea(projected_pixel, search_radius, min_level, max_level);
+    keyframe->appendFeatureIndicesInArea(projected_pixel, search_radius,
+                                         min_level, max_level, candidate_indices);
+
+    if (result != nullptr)
+        result->fusion_feature_candidate_num += candidate_indices.size();
 
     if (candidate_indices.empty())
         return -1;
@@ -1450,6 +1715,9 @@ int LocalMapper::findFuseMatchInKeyframe(const std::shared_ptr<MapPoint>& map_po
 
         const int descriptor_distance = descriptorDistanceFast(
             descriptors.row(feature_idx), map_descriptor);
+
+        if (result != nullptr)
+            result->fusion_descriptor_comparison_num++;
 
         // ORB-SLAM2 logic reference: Fuse() accepts only TH_LOW (50), not
         // the TH_HIGH=100 used by tracking projection matching.
@@ -1506,7 +1774,8 @@ void LocalMapper::mergeMapPoints(const std::shared_ptr<MapPoint>& keep_point,
 
 std::size_t LocalMapper::fuseMapPointsIntoKeyframe(
     const std::vector<std::shared_ptr<MapPoint>>& source_map_points,
-    const std::shared_ptr<Frame>& target_keyframe) const
+    const std::shared_ptr<Frame>& target_keyframe,
+    LocalMappingResult* result) const
 {
     if (target_keyframe == nullptr || !target_keyframe->isKeyframe() || source_map_points.empty())
         return 0;
@@ -1529,6 +1798,8 @@ std::size_t LocalMapper::fuseMapPointsIntoKeyframe(
 
     std::unordered_set<int> used_feature_indices;
     used_feature_indices.reserve(target_features.size());
+    std::vector<int> candidate_indices;
+    candidate_indices.reserve(32);
 
     std::unordered_set<std::size_t> touched_ids;
     std::vector<std::shared_ptr<MapPoint>> touched_points;
@@ -1555,6 +1826,8 @@ std::size_t LocalMapper::fuseMapPointsIntoKeyframe(
         cv::Point2f projected_pixel;
         double camera_distance = 0.0;
         int pred_level = 0;
+        if (result != nullptr)
+            result->fusion_projection_attempt_num++;
         if (!projectionMapPointToFrame(source_map_point, 
                                         projection_context,
                                         projected_pixel, 
@@ -1562,6 +1835,12 @@ std::size_t LocalMapper::fuseMapPointsIntoKeyframe(
                                         pred_level))
         {
             continue;
+        }
+
+        if (result != nullptr)
+        {
+            result->fusion_projection_valid_num++;
+            result->fusion_descriptor_query_num++;
         }
 
         cv::Mat map_descriptor;
@@ -1573,7 +1852,9 @@ std::size_t LocalMapper::fuseMapPointsIntoKeyframe(
                                                                 map_descriptor,
                                                                 projected_pixel, 
                                                                 pred_level, 
-                                                                used_feature_indices);
+                                                                used_feature_indices,
+                                                                candidate_indices,
+                                                                result);
         if (matched_feature_idx < 0 || matched_feature_idx >= target_features.size())
             continue;
         
@@ -1613,7 +1894,8 @@ std::size_t LocalMapper::fuseMapPointsIntoKeyframe(
 }
 
 std::size_t LocalMapper::searchInNeighbors(const std::shared_ptr<Map>& map,
-                                           const std::shared_ptr<Frame>& cur_frame) const
+                                           const std::shared_ptr<Frame>& cur_frame,
+                                           LocalMappingResult* result) const
 {
     if (map == nullptr || cur_frame == nullptr || !cur_frame->isKeyframe())
         return 0;
@@ -1622,11 +1904,17 @@ std::size_t LocalMapper::searchInNeighbors(const std::shared_ptr<Map>& map,
     const std::vector<std::shared_ptr<Frame>> neighbor_keyframes = 
         collectFusionKeyframes(cur_frame);
 
+    if (result != nullptr)
+        result->fusion_target_keyframe_num += neighbor_keyframes.size() * 2;
+
     if (neighbor_keyframes.empty())
         return 0;
 
     const std::vector<std::shared_ptr<MapPoint>> cur_map_points = 
         collectUniqueMapPointsFromKeyframe(cur_frame);
+
+    if (result != nullptr)
+        result->fusion_source_map_point_num += cur_map_points.size();
 
     std::vector<std::vector<std::shared_ptr<MapPoint>>> neighbor_map_points_sets;
     neighbor_map_points_sets.reserve(neighbor_keyframes.size());
@@ -1640,31 +1928,41 @@ std::size_t LocalMapper::searchInNeighbors(const std::shared_ptr<Map>& map,
         }
 
         neighbor_map_points_sets.push_back(collectUniqueMapPointsFromKeyframe(neighbor_keyframe));
+        if (result != nullptr)
+            result->fusion_source_map_point_num += neighbor_map_points_sets.back().size();
     }
 
     const double fusion_context_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - context_start).count();
+    if (result != nullptr)
+        result->fusion_context_duration_ms = fusion_context_ms;
 
     std::size_t fused_num = 0;
 
     const auto forward_fusion_start = std::chrono::steady_clock::now();
     for (const auto& neighbor_keyframe : neighbor_keyframes)
-        fused_num += fuseMapPointsIntoKeyframe(cur_map_points, neighbor_keyframe);
+        fused_num += fuseMapPointsIntoKeyframe(cur_map_points, neighbor_keyframe, result);
     const double forward_fusion_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - forward_fusion_start).count();
 
     const auto reverse_fusion_start = std::chrono::steady_clock::now();
     for (int i = 0; i < neighbor_keyframes.size(); i++)
     {
-        fused_num += fuseMapPointsIntoKeyframe(neighbor_map_points_sets[i], cur_frame);
+        fused_num += fuseMapPointsIntoKeyframe(neighbor_map_points_sets[i], cur_frame, result);
     }
     const double reverse_fusion_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - reverse_fusion_start).count();
+    if (result != nullptr)
+        result->fusion_forward_duration_ms = forward_fusion_ms;
+    if (result != nullptr)
+        result->fusion_reverse_duration_ms = reverse_fusion_ms;
 
     const auto graph_refresh_start = std::chrono::steady_clock::now();
     updateCovisibilityGraph(map, cur_frame);
     const double graph_refresh_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - graph_refresh_start).count();
+    if (result != nullptr)
+        result->fusion_post_graph_duration_ms = graph_refresh_ms;
 
     ROS_INFO_STREAM_THROTTLE(1.0,
         "P2-EUROC-PERF-R38 fusion_sections keyframe=" << cur_frame->getId()
@@ -1728,7 +2026,8 @@ std::size_t LocalMapper::cullMapPoints(const std::shared_ptr<Map>& map,
 
 LocalMapper::KeyframeRedundancyStats LocalMapper::evaluateKeyframeRedundancy(
     const std::shared_ptr<Frame>& keyframe, 
-    const std::shared_ptr<Map>& map) const
+    const std::shared_ptr<Map>& map,
+    LocalMappingResult* result) const
 {
     KeyframeRedundancyStats stats;
 
@@ -1739,6 +2038,9 @@ LocalMapper::KeyframeRedundancyStats LocalMapper::evaluateKeyframeRedundancy(
 
     for (const auto& feature : keyframe->getFeatures())
     {
+        if (result != nullptr)
+            result->keyframe_cull_feature_num++;
+
         if (feature == nullptr || !feature->hasMapPoint())
             continue;
 
@@ -1746,19 +2048,14 @@ LocalMapper::KeyframeRedundancyStats LocalMapper::evaluateKeyframeRedundancy(
         if (map_point == nullptr || map_point->isBad())
             continue;
 
-        std::unordered_set<std::size_t> observed_keyframe_ids;
-        for (const auto& observation : map_point->getObservations())
-        {
-            if (observation == nullptr)
-                continue;
+        // A MapPoint stores at most one observation per keyframe.  Snapshot
+        // that filtered set once: the former implementation independently
+        // copied and filtered it for diagnostics, count, and support checks.
+        const std::vector<std::shared_ptr<Feature>> observations =
+            map_point->getKeyframeObservations();
 
-            const std::shared_ptr<Frame> observation_frame = observation->getFrame();
-            if (observation_frame == nullptr || !observation_frame->isKeyframe())
-                continue;
-
-            if (!observed_keyframe_ids.insert(observation_frame->getId()).second)
-                stats.duplicate_keyframe_observations++;
-        }
+        if (result != nullptr)
+            result->keyframe_cull_observation_num += observations.size();
 
         // ORB-SLAM2 logic reference: every valid MapPoint contributes to the
         // candidate keyframe denominator. Only points observed by more than
@@ -1767,13 +2064,12 @@ LocalMapper::KeyframeRedundancyStats LocalMapper::evaluateKeyframeRedundancy(
         // keyframes while they still carried unique tracking support.
         stats.total_map_features++;
 
-        if (map_point->getKeyframeObservationCount() <= kMinRedundantObservations)
+        if (observations.size() <= kMinRedundantObservations)
             continue;
 
         const int current_level = feature->getLevel();
         std::size_t support_observation_num = 0;
 
-        const std::vector<std::shared_ptr<Feature>> observations = map_point->getObservations();
         for (const auto& observation : observations)
         {
             if (observation == nullptr || observation == feature)
@@ -1810,7 +2106,8 @@ LocalMapper::KeyframeRedundancyStats LocalMapper::evaluateKeyframeRedundancy(
 
 bool LocalMapper::isKeyframeRedundant(const std::shared_ptr<Frame>& keyframe,
                                       const std::shared_ptr<Map>& map,
-                                      KeyframeRedundancyStats* stats) const
+                                      KeyframeRedundancyStats* stats,
+                                      LocalMappingResult* result) const
 {
     if (keyframe == nullptr || map == nullptr)
         return false;
@@ -1822,7 +2119,8 @@ bool LocalMapper::isKeyframeRedundant(const std::shared_ptr<Frame>& keyframe,
     if (keyframe == keyframes.front() || keyframe == keyframes.back())
         return false;
 
-    const KeyframeRedundancyStats evaluated_stats = evaluateKeyframeRedundancy(keyframe, map);
+    const KeyframeRedundancyStats evaluated_stats =
+        evaluateKeyframeRedundancy(keyframe, map, result);
     if (stats != nullptr)
     {
         *stats = evaluated_stats;
@@ -1865,13 +2163,27 @@ std::vector<std::shared_ptr<Frame>> LocalMapper::collectKeyframeCullingCandidate
 }
 
 std::size_t LocalMapper::cullKeyframes(const std::shared_ptr<Map>& map,
-                                       const std::shared_ptr<Frame>& cur_keyframe) const
+                                       const std::shared_ptr<Frame>& cur_keyframe,
+                                       LocalMappingResult* result) const
 {
     if (map == nullptr || cur_keyframe == nullptr || !cur_keyframe->isKeyframe())
         return 0;
 
-    const std::vector<std::shared_ptr<Frame>> candidate = 
+    const auto candidate_collection_start = std::chrono::steady_clock::now();
+    const std::vector<std::shared_ptr<Frame>> candidate =
         collectKeyframeCullingCandidates(cur_keyframe);
+    const double candidate_collection_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - candidate_collection_start).count();
+
+    if (result != nullptr)
+    {
+        result->keyframe_cull_candidate_num += candidate.size();
+        result->keyframe_cull_candidate_collection_duration_ms = candidate_collection_ms;
+    }
+
+    // cullKeyframes() runs inside the current transaction, so the result is
+    // a per-keyframe profile and cannot affect later admission decisions.
+    // The active result is set by processNewKeyframe below.
 
     if (candidate.empty())
         return 0;
@@ -1887,7 +2199,14 @@ std::size_t LocalMapper::cullKeyframes(const std::shared_ptr<Map>& map,
         }
 
         KeyframeRedundancyStats redundancy_stats;
-        const bool redundant = isKeyframeRedundant(keyframe, map, &redundancy_stats);
+        const auto evaluation_start = std::chrono::steady_clock::now();
+        const bool redundant = isKeyframeRedundant(keyframe, map, &redundancy_stats, result);
+        if (result != nullptr)
+        {
+            result->keyframe_cull_evaluation_duration_ms +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - evaluation_start).count();
+        }
         ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R10 mini_kfcull current=" << cur_keyframe->getId()
                         << " candidate=" << keyframe->getId()
                         << " map_keyframes=" << map->getKeyframeNum()
@@ -1902,7 +2221,14 @@ std::size_t LocalMapper::cullKeyframes(const std::shared_ptr<Map>& map,
 
         // ORB-SLAM2 logic reference: retire a redundant keyframe immediately,
         // so later candidates are evaluated against the updated observations.
+        const auto removal_start = std::chrono::steady_clock::now();
         map->removeKeyframe(keyframe);
+        if (result != nullptr)
+        {
+            result->keyframe_cull_removal_duration_ms +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - removal_start).count();
+        }
         culled_keyframe_num++;
     }
 

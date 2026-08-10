@@ -35,6 +35,6 @@ mini_orb_slam:
 # ORB-SLAM2 logic reference: monocular scheduling uses mMinFrames=0 and
 # mMaxFrames=Camera.fps (approximately 20 Hz for KITTI/EuRoC inputs).
 min_keyframe_gap: 0
-max_keyframe_gap: 20
+max_keyframe_gap: 10
 max_tracking_reproj_error: 8.0
 max_relocalization_candidates: 5

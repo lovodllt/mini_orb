@@ -343,10 +343,6 @@ Tracker::ProjectionFeatureSearchResult Tracker::findBestFeatureInArea(
     // motion prediction and can perturb the local-map pose refinement.
     const int max_level = std::min(levels_num_ - 1, predicted_level);
 
-    // The radius gate is equivalent in squared form and avoids constructing a
-    // temporary point plus a square root for every projected map-point.
-    const float search_radius_squared = search_radius * search_radius;
-
     const std::vector<int> candidate_indices = frame->getFeatureIndicesInArea(projected_pixel, 
                                                                               search_radius, 
                                                                               min_level, 
@@ -380,10 +376,8 @@ Tracker::ProjectionFeatureSearchResult Tracker::findBestFeatureInArea(
 
         const int feature_level = feature->getLevel();
 
-        const cv::Point2f pixel_delta = feature->getKeyPoint().pt - projected_pixel;
-        const float pixel_distance_squared = pixel_delta.x * pixel_delta.x +
-                                              pixel_delta.y * pixel_delta.y;
-        if (pixel_distance_squared > search_radius_squared)
+        const double pixel_distance = cv::norm(feature->getKeyPoint().pt - projected_pixel);
+        if (pixel_distance > search_radius)
             continue;
 
         const cv::Mat cur_descriptor = descriptors.row(i);
@@ -430,12 +424,15 @@ Tracker::ProjectionFeatureSearchResult Tracker::findBestFeatureInArea(
 }
 
 PnPResult Tracker::trackFrameByMap(const std::shared_ptr<Map>& map,
-                                   const std::shared_ptr<Frame>& cur_frame) const
+                                   const std::shared_ptr<Frame>& cur_frame,
+                                   bool map_mutex_held) const
 {
     if (map == nullptr)
         return {};
 
-    const std::vector<std::shared_ptr<MapPoint>> map_points = map->copyMapPoints();
+    const std::vector<std::shared_ptr<MapPoint>> map_points = map_mutex_held
+        ? map->copyMapPointsLocked()
+        : map->copyMapPoints();
     return trackFrameByDescriptorMapPoints(map_points, cur_frame);
 }
 

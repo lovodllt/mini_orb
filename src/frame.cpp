@@ -100,22 +100,18 @@ void Frame::updateConnections()
 
     for (const auto& feature : features_)
     {
-        if (feature == nullptr || !feature->hasMapPoint())
+        if (feature == nullptr)
             continue;
 
         const std::shared_ptr<MapPoint> map_point = feature->getMapPoint();
         if (map_point == nullptr || map_point->isBad())
             continue;
 
-        const std::vector<std::shared_ptr<Feature>> observations = 
-            map_point->getKeyframeObservations();
+        const std::vector<std::shared_ptr<Frame>> observations =
+            map_point->getKeyframeObservationFrames();
 
-        for (const auto& obs_feature : observations)
+        for (const auto& keyframe : observations)
         {
-            if (obs_feature == nullptr)
-                continue;
-
-            const std::shared_ptr<Frame> keyframe = obs_feature->getFrame();
             if (keyframe == nullptr || keyframe.get() == this || !keyframe->isKeyframe())
                 continue;
 
@@ -347,8 +343,20 @@ std::vector<int> Frame::getFeatureIndicesInArea(const cv::Point2d& pt,
 {
     std::vector<int> indices;
 
+    appendFeatureIndicesInArea(pt, radius, min_level, max_level, indices);
+    return indices;
+}
+
+void Frame::appendFeatureIndicesInArea(const cv::Point2d& pt,
+                                       float radius,
+                                       int min_level,
+                                       int max_level,
+                                       std::vector<int>& indices) const
+{
+    indices.clear();
+
     if (feature_grid_.empty() || img_.empty())
-        return indices;
+        return;
 
     const int min_cell_x = 
         std::max(0, static_cast<int>((pt.x - radius) * grid_cell_width_inv_));
@@ -360,7 +368,7 @@ std::vector<int> Frame::getFeatureIndicesInArea(const cv::Point2d& pt,
         std::min(grid_rows_ - 1, static_cast<int>((pt.y + radius) * grid_cell_height_inv_));
 
     if (min_cell_x > max_cell_x || min_cell_y > max_cell_y)
-        return indices;
+        return;
 
     for (int y = min_cell_y; y <= max_cell_y; y++)
     {
@@ -385,7 +393,6 @@ std::vector<int> Frame::getFeatureIndicesInArea(const cv::Point2d& pt,
         }
     }
 
-    return indices;
 }
 
 } // namespace mini_orb_slam

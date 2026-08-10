@@ -1,7 +1,9 @@
 #include <iomanip>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <unordered_map>
+#include <unordered_set>
 #include <Eigen/Geometry>
 #include <geometry_msgs/PoseStamped.h>
 #include <std_msgs/UInt64.h>
@@ -38,7 +40,35 @@ private:
 
 Frontend::Frontend(ros::NodeHandle& nh) : nh_(nh) {}
 
+Frontend::~Frontend()
+{
+    // LocalMapping can enqueue into LoopCloser. Join it first while the
+    // LoopCloser object is still alive, then stop the loop worker.
+    if (local_mapper_ != nullptr)
+    {
+        local_mapper_->requestFinish();
+        local_mapper_->join();
+        local_mapper_->setLoopCloser(nullptr);
+    }
+
+    if (loop_closer_ != nullptr)
+    {
+        loop_closer_->requestFinish();
+        loop_closer_->join();
+    }
+}
+
 bool Frontend::init()
+{
+    return initImpl(true);
+}
+
+bool Frontend::initOffline()
+{
+    return initImpl(false);
+}
+
+bool Frontend::initImpl(bool enable_ros_transport)
 {
     nh_.param("camera_topic", camera_topic_, std::string("/camera/image_raw"));
     nh_.param("camera_info_topic", camera_info_topic_, std::string("/camera/camera_info"));
@@ -154,8 +184,6 @@ bool Frontend::init()
                                                   pose_optimizer_,
                                                   orb_extractor_.getScaleFactor(),
                                                   orb_extractor_.getLevelsNum());
-    if (local_mapper_ != nullptr)
-        local_mapper_->start();
 
     if (!vocabulary_path_.empty())
     {
@@ -177,9 +205,6 @@ bool Frontend::init()
                                                             orb_extractor_.getScaleFactor(),
                                                             orb_extractor_.getLevelsNum());
 
-            if (loop_closer_ != nullptr)
-                loop_closer_->start();
-
             ROS_INFO_STREAM("BoW vocabulary loaded from: " << vocabulary_path_);
         }
     }
@@ -188,14 +213,28 @@ bool Frontend::init()
         ROS_WARN("BoW vocabulary path is empty. BoW-based relocalization will be disabled.");
     }
 
-    pose_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/pose", 1);
-    // Replay acknowledgement is a transport stream, not a latched status:
-    // retain every count while the publisher is flow-controlled.
-    processed_image_pub_ = nh_.advertise<std_msgs::UInt64>(processed_image_topic_, 600);
-    image_sub_ = nh_.subscribe(camera_topic_, image_queue_size_, &Frontend::imageCallback, this);
+    if (local_mapper_ != nullptr)
+    {
+        local_mapper_->setKeyframeDatabase(bow_vocabulary_, keyframe_database_);
+        local_mapper_->setLoopCloser(loop_closer_.get());
+        local_mapper_->start();
+    }
 
-    ROS_INFO_STREAM("Frontend initialized. image topic: " << camera_topic_
-                    << ", processed image topic: " << processed_image_topic_);
+    if (loop_closer_ != nullptr)
+        loop_closer_->start();
+
+    if (enable_ros_transport)
+    {
+        pose_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/pose", 1);
+        // Replay acknowledgement is a transport stream, not a latched status:
+        // retain every count while the publisher is flow-controlled.
+        processed_image_pub_ = nh_.advertise<std_msgs::UInt64>(processed_image_topic_, 600);
+        image_sub_ = nh_.subscribe(camera_topic_, image_queue_size_, &Frontend::imageCallback, this);
+    }
+
+    ROS_INFO_STREAM("Frontend initialized. input mode: "
+                    << (enable_ros_transport ? "ROS image transport" : "direct offline image")
+                    << ", image topic: " << camera_topic_);
     return true;
 }
 
@@ -1013,23 +1052,12 @@ bool Frontend::shouldInsertKeyframe(const std::shared_ptr<Map>& map,
 
     const std::size_t frame_gap = cur_frame->getId() - last_keyframe->getId();
 
-    const bool local_mapping_idle = (local_mapper_ == nullptr) ||
-                                    (local_mapper_->acceptKeyframe() &&
-                                    !local_mapper_->isStopped() &&
-                                    !local_mapper_->stopRequested());
-
     const bool force_insert = frame_gap >= max_keyframe_gap_;
     const bool allow_insert = frame_gap >= min_keyframe_gap_;
     const bool weak_tracking = current_inlier_num < 
                                (kMonoReferenceRatio * reference_reliable_point_num);
 
     keyframe_decision_num_++;
-
-    if (!local_mapping_idle)
-    {
-        keyframe_busy_rejected_num_++;
-        return false;
-    }
 
     const bool insert = force_insert || (allow_insert && weak_tracking);
     if (insert)
@@ -1039,10 +1067,21 @@ bool Frontend::shouldInsertKeyframe(const std::shared_ptr<Map>& map,
         else
             keyframe_weak_insert_num_++;
     }
-
+    ROS_INFO_STREAM(
+        "P2-KITTI-DIAG-R131 keyframe_admission frame=" << cur_frame->getId()
+        << " reference=" << reference_keyframe->getId()
+        << " map_kf=" << keyframe_num
+        << " gap=" << frame_gap
+        << " inliers=" << current_inlier_num
+        << " reference_reliable=" << reference_reliable_point_num
+        << " allow=" << (allow_insert ? 1 : 0)
+        << " weak=" << (weak_tracking ? 1 : 0)
+        << " force=" << (force_insert ? 1 : 0)
+        << " insert=" << (insert ? 1 : 0));
     ROS_INFO_STREAM_THROTTLE(1.0,
         "P2-EUROC-PERF-R29 keyframe_decision total=" << keyframe_decision_num_
         << " busy_rejected=" << keyframe_busy_rejected_num_
+        << " commit_barrier=" << keyframe_commit_barrier_num_
         << " force_insert=" << keyframe_force_insert_num_
         << " weak_insert=" << keyframe_weak_insert_num_
         << " frame_gap=" << frame_gap
@@ -1988,7 +2027,8 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
     // weak. A descriptor PnP over the active map is the final tracking-stage
     // fallback; relocalization remains the separate recovery path.
     const auto map_seed_start = std::chrono::steady_clock::now();
-    const PnPResult map_pnp_result = tracker_->trackFrameByMap(init_result_.map, cur_frame);
+    const PnPResult map_pnp_result =
+        tracker_->trackFrameByMap(init_result_.map, cur_frame, true);
     const double map_seed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - map_seed_start).count();
     ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R18 frame=" << cur_frame->getId()
@@ -2113,8 +2153,8 @@ bool Frontend::tryRelocalization(const std::shared_ptr<Frame>& cur_frame,
     if (!backup_R.empty() && !backup_t.empty())
         cur_frame->setPose(backup_R, backup_t);
         
-    PnPResult fallback_pnp_result = 
-        tracker_->trackFrameByMap(init_result_.map, cur_frame);
+    PnPResult fallback_pnp_result =
+        tracker_->trackFrameByMap(init_result_.map, cur_frame, true);
     if (!fallback_pnp_result.success)
         return false;
 
@@ -2131,39 +2171,37 @@ bool Frontend::tryRelocalization(const std::shared_ptr<Frame>& cur_frame,
     return true;
 }
 
-void Frontend::drainLocalMappingResults()
+void Frontend::consumeLocalMappingResult(const LocalMappingOutput& output)
 {
-    if (local_mapper_ == nullptr)
+    const std::shared_ptr<Map> map = output.input.map;
+    const std::shared_ptr<Frame> cur_keyframe = output.input.cur_keyframe;
+    if (map == nullptr || cur_keyframe == nullptr || !cur_keyframe->isKeyframe())
         return;
 
-    LocalMappingOutput output;
-    while (local_mapper_->tryPopFinishedResult(output))
-    {
-        const std::shared_ptr<Map> map = output.input.map;
-        const std::shared_ptr<Frame> cur_keyframe = output.input.cur_keyframe;
-        if (map == nullptr || cur_keyframe == nullptr || !cur_keyframe->isKeyframe())
-            continue;
-
-        if (init_result_.map == nullptr || map != init_result_.map)
-            continue;
-
-        std::lock_guard<std::mutex> map_lock(map->getMutex());
+    if (init_result_.map == nullptr || map != init_result_.map)
+        return;
 
         // Keep the existing tracking reference when it still belongs to the
         // active map. A newly inserted keyframe may contain only the weak
         // inlier set that triggered insertion and is not yet a robust
         // relocalization anchor.
-        const std::shared_ptr<Frame> existing_reference =
-            tracking_reference_keyframe_.lock();
-        if (existing_reference == nullptr || !existing_reference->isKeyframe())
-            tracking_reference_keyframe_ = cur_keyframe;
-        registerKeyframeInDatabase(cur_keyframe);
+    const std::shared_ptr<Frame> existing_reference =
+        tracking_reference_keyframe_.lock();
+    if (existing_reference == nullptr || !existing_reference->isKeyframe())
+        tracking_reference_keyframe_ = cur_keyframe;
 
-        ROS_INFO_STREAM("Inserted new keyframe: " << cur_keyframe->getId()
-                        << ", keyframe num: " << map->getKeyframeNum()
+    ROS_INFO_STREAM("Inserted new keyframe: " << cur_keyframe->getId()
+                        << ", keyframe num: " << output.result.active_keyframe_num
                         << ", new map points: " << output.result.new_map_point_num
                         << ", culled map points: " << output.result.culled_map_point_num
                         << ", culled keyframes: " << output.result.culled_keyframe_num
+                        << ", fusion called: "
+                        << (output.result.fusion_called ? "true" : "false")
+                        << ", keyframe cull called: "
+                        << (output.result.keyframe_cull_called ? "true" : "false")
+                        << ", convergence yielded: "
+                        << (output.result.convergence_skipped_for_pending_keyframe
+                            ? "true" : "false")
                         << ", local ba called: "
                         << (output.result.local_ba_called ? "true" : "false")
                         << ", local ba solver success: "
@@ -2184,28 +2222,100 @@ void Frontend::drainLocalMappingResults()
                         << ", local ba rejection reason: "
                         << (output.result.local_ba_rejection_reason.empty()
                             ? "none" : output.result.local_ba_rejection_reason)
-                        << ", total map points: " << map->getMapPointNum());
+                        << ", total map points: " << output.result.active_map_point_num
+                        << ", keyframe database registered: "
+                        << (output.result.keyframe_database_registered ? "true" : "false")
+                        << ", loop keyframe queued: "
+                        << (output.result.loop_keyframe_queued ? "true" : "false"));
 
         // Current project adaptation: normal frames lack ORB-SLAM2's stored
         // reference-keyframe-relative pose, so a committed Local BA can make
         // the cached normal-frame velocity stale.
-        if (output.result.local_ba_success)
-            resetMotionModel();
+    if (output.result.local_ba_success)
+        resetMotionModel();
+}
 
-        if (loop_closer_ != nullptr)
+void Frontend::drainLocalMappingResults()
+{
+    if (local_mapper_ == nullptr)
+        return;
+
+    LocalMappingOutput output;
+    while (local_mapper_->tryPopFinishedResult(output))
+        consumeLocalMappingResult(output);
+}
+
+bool Frontend::submitKeyframeWithCommitBarrier(
+    const std::shared_ptr<Map>& map,
+    const std::shared_ptr<Frame>& cur_frame,
+    const PnPResult& tracking_seed,
+    const TrackingResult& tracking_result)
+{
+    if (local_mapper_ == nullptr || map == nullptr || cur_frame == nullptr)
+        return false;
+
+    const auto barrier_start = std::chrono::steady_clock::now();
+    LocalMappingOutput completed_output;
+    while (!local_mapper_->acceptKeyframe())
+    {
+        if (local_mapper_->waitPopFinishedResult(completed_output))
         {
-            LoopClosingInput input;
-            input.map = map;
-            input.cur_keyframe = cur_keyframe;
-
-            const bool loop_queued = loop_closer_->insertKeyframe(input);
-            if (loop_queued)
-            {
-                 ROS_INFO_STREAM("Queued loop closing keyframe: " << cur_keyframe->getId()
-                                 << ", keyframe num: " << map->getKeyframeNum());
-            }
+            consumeLocalMappingResult(completed_output);
+            continue;
         }
+
+        if (local_mapper_->finishRequested())
+            return false;
     }
+
+    std::shared_ptr<Frame> ref_keyframe;
+    bool keyframe_queued = false;
+    std::size_t keyframe_num_before_mapping = 0;
+    while (!keyframe_queued)
+    {
+        while (!local_mapper_->acceptKeyframe())
+        {
+            if (local_mapper_->waitPopFinishedResult(completed_output))
+            {
+                consumeLocalMappingResult(completed_output);
+                continue;
+            }
+            if (local_mapper_->finishRequested())
+                return false;
+        }
+
+        std::lock_guard<std::mutex> map_lock(map->getMutex());
+        if (init_result_.map != map)
+            return false;
+
+        ref_keyframe = map->getLastKeyframe();
+        if (ref_keyframe == nullptr || !ref_keyframe->isKeyframe())
+            return false;
+
+        keyframe_num_before_mapping = map->getKeyframeNum();
+        cur_frame->setKeyframe(true);
+        keyframe_queued = local_mapper_->insertKeyframe(
+            LocalMappingInput{map, ref_keyframe, cur_frame, tracking_seed});
+        if (!keyframe_queued)
+            cur_frame->setKeyframe(false);
+    }
+
+    keyframe_commit_barrier_num_++;
+    ROS_INFO_STREAM("Queued new keyframe: " << cur_frame->getId()
+                    << ", ref keyframe: " << ref_keyframe->getId()
+                    << ", tracking inliers: " << tracking_result.inlier_map_points.size()
+                    << ", map keyframe num(before local mapping): "
+                    << keyframe_num_before_mapping);
+
+    if (!local_mapper_->waitPopFinishedResult(completed_output))
+        return false;
+    consumeLocalMappingResult(completed_output);
+
+    const double barrier_wait_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - barrier_start).count();
+    ROS_INFO_STREAM("P2-KITTI-SCHED-R136 commit_barrier frame=" << cur_frame->getId()
+                    << " wait_ms=" << barrier_wait_ms);
+    return true;
 }
 
 void Frontend::drainLoopClosingResults()
@@ -2284,6 +2394,7 @@ void Frontend::acceptTrackingResult(const std::shared_ptr<Frame>& cur_frame,
     status_ = FrontendStatus::TRACKING;
 
     const std::shared_ptr<Map> map = init_result_.map;
+    bool keyframe_requested = false;
     if (map != nullptr)
     {
         const auto map_lock_start = std::chrono::steady_clock::now();
@@ -2305,34 +2416,7 @@ void Frontend::acceptTrackingResult(const std::shared_ptr<Frame>& cur_frame,
 
         if (shouldInsertKeyframe(map, cur_frame, tracking_result_))
         {
-            const std::shared_ptr<Frame> ref_keyframe = map->getLastKeyframe();
-            bool keyframe_queued = false;
-
-            if (local_mapper_ != nullptr && ref_keyframe != nullptr)
-            {
-                cur_frame->setKeyframe(true); 
-
-                LocalMappingInput input;
-                input.map = init_result_.map;
-                input.ref_keyframe = ref_keyframe;
-                input.cur_keyframe = cur_frame;
-                input.tracking_seed = pnp_result;
-
-                keyframe_queued = local_mapper_->insertKeyframe(input);
-
-                if (!keyframe_queued)
-                    cur_frame->setKeyframe(false);
-            }
-
-            if (keyframe_queued)
-            {
-                ROS_INFO_STREAM("Queued new keyframe: " << cur_frame->getId()
-                                << ", ref keyframe: " << ref_keyframe->getId()
-                                << ", tracking inliers: "
-                                << tracking_result.inlier_map_points.size()
-                                << ", map keyframe num(before local mapping): "
-                                << init_result_.map->getKeyframeNum());
-            }
+            keyframe_requested = true;
         }
         else if (relocalization_cooldown_remaining_ > 0) 
         {
@@ -2340,6 +2424,12 @@ void Frontend::acceptTrackingResult(const std::shared_ptr<Frame>& cur_frame,
                                     "Recovery cooldown active. Skip keyframe insertion. remaining=" 
                                     << relocalization_cooldown_remaining_);                       
         }
+    }
+
+    if (keyframe_requested &&
+        !submitKeyframeWithCommitBarrier(map, cur_frame, pnp_result, tracking_result_))
+    {
+        ROS_WARN_STREAM("Keyframe commit barrier did not submit frame " << cur_frame->getId());
     }
     else if (!recovered_from_tmp_lost)
     {
@@ -2622,6 +2712,19 @@ void Frontend::imageCallback(const sensor_msgs::ImageConstPtr& msg)
         }
     }
 
+    processImage(gray, msg->header.stamp.toSec());
+}
+
+void Frontend::processImage(const cv::Mat& image, double timestamp)
+{
+    if (image.empty() || image.channels() != 1)
+    {
+        ROS_ERROR("Direct frontend input must be a non-empty mono image.");
+        return;
+    }
+
+    cv::Mat gray = image;
+
     if (!lockCalibrationForImage(gray.size()))
         return;
 
@@ -2634,8 +2737,7 @@ void Frontend::imageCallback(const sensor_msgs::ImageConstPtr& msg)
 
     gray = undistorted_gray;
 
-    const double stamp = msg->header.stamp.toSec();
-    std::shared_ptr<Frame> cur_frame = buildFrame(next_frame_id_, stamp, gray);
+    std::shared_ptr<Frame> cur_frame = buildFrame(next_frame_id_, timestamp, gray);
     next_frame_id_++;
 
     if (cur_frame == nullptr || !cur_frame->hasFeatures())
@@ -2724,12 +2826,16 @@ void Frontend::imageCallback(const sensor_msgs::ImageConstPtr& msg)
 
             tracking_accepted = 
                 track_success && isTrackingAccepted(pnp_result, new_tracking_result, required_inliers);
+        }
 
-            if (!tracking_accepted)
-            {
-                relocal_success = 
-                    tryRelocalization(cur_frame, relocal_pnp_result, relocal_tracking_result);
-            }
+        // Relocalization obtains its own map snapshot through
+        // collectRelocalizationCandidates()/Map::copyKeyframes().  Do not
+        // call it while the tracking transaction owns Map::mutex_: the
+        // snapshot helper would otherwise self-deadlock on the same mutex.
+        if (!tracking_accepted)
+        {
+            relocal_success =
+                tryRelocalization(cur_frame, relocal_pnp_result, relocal_tracking_result);
         }
 
         const double tracking_section_ms = std::chrono::duration<double, std::milli>(
@@ -2795,11 +2901,11 @@ void Frontend::imageCallback(const sensor_msgs::ImageConstPtr& msg)
         TrackingResult relocal_tracking_result;
         bool relocal_success = false;
 
-        {
-            std::lock_guard<std::mutex> map_lock(init_result_.map->getMutex());
-            relocal_success = 
-                tryRelocalization(cur_frame, relocal_pnp_result, relocal_tracking_result);
-        }
+        // tryRelocalization() takes a consistent map snapshot internally;
+        // keep it outside the caller's map transaction to avoid recursive
+        // acquisition of Map::mutex_.
+        relocal_success =
+            tryRelocalization(cur_frame, relocal_pnp_result, relocal_tracking_result);
 
         if (relocal_success)
         {

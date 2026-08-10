@@ -146,8 +146,28 @@ struct LocalBAResult
     bool solver_success{false};
     bool accepted{false};
 
+    std::size_t local_keyframe_num{0};
+    std::size_t fixed_keyframe_num{0};
+    std::size_t local_map_point_num{0};
+    std::size_t observation_num{0};
+    std::size_t map_points_with_2_ba_edges{0};
+    std::size_t map_points_with_3_ba_edges{0};
+    std::size_t map_points_with_4_or_more_ba_edges{0};
+
     int edge_num{0};
     int rejected_edge_num{0};
+
+    // Formal performance accounting. These fields identify whether a slow
+    // Local BA is dominated by snapshot construction, g2o, or map publication.
+    double context_build_ms{0.0};
+    double graph_build_ms{0.0};
+    double solve_ms{0.0};
+    double validation_ms{0.0};
+    double view_statistics_ms{0.0};
+    double descriptor_refresh_ms{0.0};
+    double commit_ms{0.0};
+
+    std::size_t descriptor_refresh_num{0};
 
     double seed_reproj_error{0.0};
     double candidate_seed_reproj_error{0.0};
@@ -161,12 +181,66 @@ struct LocalMappingResult
     std::size_t new_map_point_num{0};
     std::size_t culled_map_point_num{0};
     std::size_t culled_keyframe_num{0};
+    std::size_t active_keyframe_num{0};
+    std::size_t active_map_point_num{0};
+
+    // Work counters are diagnostic only. They describe the candidate volume
+    // behind the timed Local Mapping phases without affecting any decision.
+    std::size_t triangulation_partner_num{0};
+    std::size_t triangulation_pair_num{0};
+    std::size_t triangulation_candidate_match_num{0};
+    std::size_t triangulation_svd_num{0};
+    std::size_t triangulation_valid_point_num{0};
+
+    std::size_t fusion_target_keyframe_num{0};
+    std::size_t fusion_source_map_point_num{0};
+    std::size_t fusion_projection_attempt_num{0};
+    std::size_t fusion_projection_valid_num{0};
+    std::size_t fusion_descriptor_query_num{0};
+    std::size_t fusion_feature_candidate_num{0};
+    std::size_t fusion_descriptor_comparison_num{0};
+
+    std::size_t keyframe_cull_candidate_num{0};
+    std::size_t keyframe_cull_feature_num{0};
+    std::size_t keyframe_cull_observation_num{0};
+
+    bool keyframe_database_registered{false};
+    bool loop_keyframe_queued{false};
+
+    // The required mapping phase always runs.  These counters distinguish it
+    // from the ORB-SLAM2-style convergence work, which may yield to a newer
+    // admitted keyframe.
+    bool fusion_called{false};
+    bool keyframe_cull_called{false};
+    bool convergence_skipped_for_pending_keyframe{false};
 
     bool local_ba_called{false};
     bool local_ba_solver_success{false};
     bool local_ba_success{false};
     bool local_ba_rejected{false};
 
+    double total_duration_ms{0.0};
+    double keyframe_commit_duration_ms{0.0};
+    double map_point_cull_duration_ms{0.0};
+    double triangulation_duration_ms{0.0};
+    // R148 diagnostics split triangulation into matching, reconstruction, and
+    // MapPoint publication. These fields do not affect mapping decisions.
+    double triangulation_match_duration_ms{0.0};
+    double triangulation_geometry_duration_ms{0.0};
+    double triangulation_commit_duration_ms{0.0};
+    double fusion_duration_ms{0.0};
+    // R143 diagnostics split fusion work from the covisibility refreshes.
+    // These fields are observational only and do not affect mapping decisions.
+    double fusion_pre_graph_duration_ms{0.0};
+    double fusion_context_duration_ms{0.0};
+    double fusion_forward_duration_ms{0.0};
+    double fusion_reverse_duration_ms{0.0};
+    double fusion_post_graph_duration_ms{0.0};
+    double fusion_reference_graph_duration_ms{0.0};
+    double keyframe_cull_duration_ms{0.0};
+    double keyframe_cull_candidate_collection_duration_ms{0.0};
+    double keyframe_cull_evaluation_duration_ms{0.0};
+    double keyframe_cull_removal_duration_ms{0.0};
     double local_ba_duration_ms{0.0};
 
     int local_ba_edge_num{0};
@@ -183,6 +257,7 @@ struct LocalMappingInput
     std::shared_ptr<Frame> ref_keyframe;
     std::shared_ptr<Frame> cur_keyframe;
     PnPResult tracking_seed;
+    std::size_t map_version{0};
 };
 
 struct LocalMappingOutput

@@ -6,7 +6,6 @@
 #include <mutex>
 #include <thread>
 #include <deque>
-#include <atomic>
 #include <condition_variable>
 #include <unordered_set>
 
@@ -19,6 +18,10 @@
 
 namespace mini_orb_slam
 {
+
+class BoWVocabulary;
+class KeyframeDatabase;
+class LoopCloser;
 
 class LocalMapper
 {
@@ -36,18 +39,31 @@ public:
     void requestStop();
     void release();
 
-    bool insertKeyframe(const LocalMappingInput& inoput);
+    // These dependencies are configured before start() and are then owned by
+    // Frontend for the whole LocalMapper worker lifetime.
+    void setKeyframeDatabase(const std::shared_ptr<BoWVocabulary>& vocabulary,
+                             const std::shared_ptr<KeyframeDatabase>& database);
+    void setLoopCloser(LoopCloser* loop_closer);
+
+    // At most one keyframe can be waiting behind the worker.  This is an
+    // admission gate, not a bounded FIFO: a frame is either atomically
+    // admitted or remains a normal tracking frame.
+    bool insertKeyframe(const LocalMappingInput& input);
     bool hasPendingKeyframe() const;
     bool tryPopFinishedResult(LocalMappingOutput& output);
+    bool waitPopFinishedResult(LocalMappingOutput& output);
 
+    // Results are consumed independently from admission.  A completed output
+    // must never stall tracking's next Mapper admission.
     bool acceptKeyframe() const;
     bool isStopped() const;
     bool stopRequested() const;
+    bool finishRequested() const;
 
     LocalMappingResult processNewKeyframe(const std::shared_ptr<Map>& map,
                                           const std::shared_ptr<Frame>& ref_keyframe,
                                           const std::shared_ptr<Frame>& cur_keyframe,
-                                          const PnPResult& tracking_seed) const;
+                                          const PnPResult& tracking_seed);
 
 private:
     void run();
@@ -74,12 +90,14 @@ private:
     std::size_t growMapByKeyFrames(const std::shared_ptr<Map>& map,
                                    const std::shared_ptr<Frame>& ref_keyframe,
                                    const std::shared_ptr<Frame>& cur_keyframe,
-                                   std::size_t current_local_mapping_generation) const;
+                                   std::size_t current_local_mapping_generation,
+                                   LocalMappingResult* result) const;
 
     std::size_t growMapByKeyFramePair(const std::shared_ptr<Map>& map,
                                       const std::shared_ptr<Frame>& ref_keyframe,
                                       const std::shared_ptr<Frame>& cur_keyframe,
-                                      std::size_t current_local_mapping_generation) const;
+                                      std::size_t current_local_mapping_generation,
+                                      LocalMappingResult* result) const;
 
     std::vector<std::shared_ptr<Frame>> collectFusionKeyframes(
         const std::shared_ptr<Frame>& cur_keyframe) const;
@@ -94,7 +112,8 @@ private:
     };
 
     std::size_t searchInNeighbors(const std::shared_ptr<Map>& map,
-                                  const std::shared_ptr<Frame>& cur_keyframe) const;
+                                  const std::shared_ptr<Frame>& cur_keyframe,
+                                  LocalMappingResult* result) const;
 
     bool projectionMapPointToFrame(const std::shared_ptr<MapPoint>& map_point,
                                    const FusionProjectionContext& context,
@@ -106,8 +125,10 @@ private:
                                  const std::shared_ptr<Frame>& keyframe,
                                  const cv::Mat& map_descriptor,
                                  const cv::Point2f& projected_pixel,
-                                int pred_level,
-                                const std::unordered_set<int>& used_feature_indices) const;
+                                 int pred_level,
+                                 const std::unordered_set<int>& used_feature_indices,
+                                std::vector<int>& candidate_indices,
+                                LocalMappingResult* result) const;
 
     std::shared_ptr<MapPoint> chooseDominantMapPoint(
         const std::shared_ptr<MapPoint>& lhs,
@@ -118,7 +139,8 @@ private:
 
     std::size_t fuseMapPointsIntoKeyframe(
         const std::vector<std::shared_ptr<MapPoint>>& source_map_points,
-        const std::shared_ptr<Frame>& target_keyframe) const;
+        const std::shared_ptr<Frame>& target_keyframe,
+        LocalMappingResult* result) const;
 
     std::size_t cullMapPoints(const std::shared_ptr<Map>& map,
                               std::size_t current_local_mapping_generation) const;
@@ -133,21 +155,31 @@ private:
 
     KeyframeRedundancyStats evaluateKeyframeRedundancy(
         const std::shared_ptr<Frame>& keyframe,
-        const std::shared_ptr<Map>& map) const;
+        const std::shared_ptr<Map>& map,
+        LocalMappingResult* result) const;
 
     bool isKeyframeRedundant(const std::shared_ptr<Frame>& keyframe,
                              const std::shared_ptr<Map>& map,
-                             KeyframeRedundancyStats* stats = nullptr) const;
+                             KeyframeRedundancyStats* stats = nullptr,
+                             LocalMappingResult* result = nullptr) const;
 
     std::vector<std::shared_ptr<Frame>> collectKeyframeCullingCandidates(
         const std::shared_ptr<Frame>& cur_keyframe) const;
 
     std::size_t cullKeyframes(const std::shared_ptr<Map>& map,
-                              const std::shared_ptr<Frame>& cur_keyframe) const;
+                              const std::shared_ptr<Frame>& cur_keyframe,
+                              LocalMappingResult* result = nullptr) const;
+
+    void handOffCommittedKeyframe(const std::shared_ptr<Map>& map,
+                                  const std::shared_ptr<Frame>& cur_keyframe,
+                                  LocalMappingResult& result) const;
     
     std::shared_ptr<Initializer> initializer_;
     const Matcher& matcher_;
     std::shared_ptr<PoseOptimizer> pose_optimizer_;
+    std::shared_ptr<BoWVocabulary> bow_vocabulary_;
+    std::shared_ptr<KeyframeDatabase> keyframe_database_;
+    LoopCloser* loop_closer_{nullptr};
 
     double scale_factor_{1.2};
     int levels_num_{8};
@@ -169,9 +201,6 @@ private:
     mutable std::list<std::shared_ptr<MapPoint>> recent_added_map_points_;
     mutable std::size_t local_mapping_generation_{0};
     mutable std::atomic_bool processing_new_keyframe_{false};
-    // g2o consumes a bool force-stop flag. It is set when a newer keyframe is
-    // queued during the opportunistic BA window.
-    mutable bool abort_ba_{false};
 };
 
 } // namespace mini_orb_slam

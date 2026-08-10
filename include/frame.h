@@ -55,6 +55,12 @@ public:
                                              int min_level,
                                              int max_level) const;
 
+    void appendFeatureIndicesInArea(const cv::Point2d& pt,
+                                    float radius,
+                                    int min_level,
+                                    int max_level,
+                                    std::vector<int>& indices) const;
+
     void updateConnections();
 
     std::vector<std::shared_ptr<Frame>> copyConnectedKeyframes(int min_weight = 1) const;

@@ -4,7 +4,6 @@
 #include <memory>
 #include <vector>
 #include <cmath>
-#include <atomic>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -43,8 +42,7 @@ public:
 
     LocalBAResult optimizeLocalMap(const std::shared_ptr<Map>& map, 
                                    const std::shared_ptr<Frame>& cur_keyframe,
-                                   const PnPResult& tracking_seed,
-                                   bool* abort_flag = nullptr) const;
+                                   const PnPResult& tracking_seed) const;
 
     bool optimizeEssentialGraph(const std::vector<std::shared_ptr<Frame>>& map_keyframes,
                                 const std::vector<std::shared_ptr<MapPoint>>& map_points,
@@ -75,6 +73,8 @@ private:
         std::vector<std::shared_ptr<Frame>> local_keyframes;
         std::vector<std::shared_ptr<Frame>> fixed_keyframes;
         std::vector<std::shared_ptr<MapPoint>> local_map_points;
+        std::unordered_map<std::size_t, std::vector<std::shared_ptr<Feature>>>
+            map_point_observation_snapshots;
         std::vector<LocalBAObservation> observations;
         std::shared_ptr<Frame> map_origin_keyframe;
         std::unordered_map<std::size_t, PoseSnapshot> keyframe_poses;
@@ -119,12 +119,18 @@ private:
 
     std::vector<std::shared_ptr<Frame>> collectFixedBAKeyframes(
         const std::vector<std::shared_ptr<Frame>>& local_keyframes,
-        const std::vector<std::shared_ptr<MapPoint>>& local_map_points) const;
+        const std::vector<std::shared_ptr<MapPoint>>& local_map_points,
+        const std::unordered_map<std::size_t,
+                                 std::vector<std::shared_ptr<Feature>>>&
+            map_point_observation_snapshots) const;
 
     std::vector<LocalBAObservation> collectLocalBAObservations(
         const std::vector<std::shared_ptr<Frame>>& local_keyframes,
         const std::vector<std::shared_ptr<Frame>>& fixed_keyframes,
-        const std::vector<std::shared_ptr<MapPoint>>& local_map_points) const;
+        const std::vector<std::shared_ptr<MapPoint>>& local_map_points,
+        const std::unordered_map<std::size_t,
+                                 std::vector<std::shared_ptr<Feature>>>&
+            map_point_observation_snapshots) const;
 
     std::vector<LocalBAObservation> selectInlierObservations(
         const std::vector<LocalBAObservation>& observations,

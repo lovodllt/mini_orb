@@ -39,6 +39,12 @@ public:
     std::vector<std::pair<int, int>> matchDescriptors(
         const cv::Mat& query_descriptors, const cv::Mat& train_descriptors) const;
 
+    // Returns the same ratio-filtered BF matches as matchDescriptors(), while
+    // retaining the Hamming distance for callers that need a second-stage
+    // geometric filter. This avoids recomputing the selected descriptor pairs.
+    std::vector<cv::DMatch> matchDescriptorsWithDistance(
+        const cv::Mat& query_descriptors, const cv::Mat& train_descriptors) const;
+
     std::vector<std::pair<int, int>> matchFramesByBoW(const Frame& ref_frame,
                                                      const Frame& cur_frame) const;
 

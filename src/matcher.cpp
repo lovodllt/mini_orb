@@ -252,15 +252,29 @@ std::vector<std::pair<int, int>> Matcher::matchDescriptors(const cv::Mat& query_
 {
     std::vector<std::pair<int, int>> match_indices;
 
+    const std::vector<cv::DMatch> matches =
+        matchDescriptorsWithDistance(query_descriptors, train_descriptors);
+    match_indices.reserve(matches.size());
+    for (const cv::DMatch& match : matches)
+        match_indices.emplace_back(match.queryIdx, match.trainIdx);
+
+    return match_indices;
+}
+
+std::vector<cv::DMatch> Matcher::matchDescriptorsWithDistance(
+    const cv::Mat& query_descriptors,
+    const cv::Mat& train_descriptors) const
+{
+    std::vector<cv::DMatch> matches;
+
     if (query_descriptors.empty() || train_descriptors.empty())
-        return match_indices;
+        return matches;
 
     std::vector<std::vector<cv::DMatch>> knn_matches;
     cv::BFMatcher matcher(cv::NORM_HAMMING, false);
     matcher.knnMatch(query_descriptors, train_descriptors, knn_matches, 2);
 
-    match_indices.reserve(knn_matches.size());
-
+    matches.reserve(knn_matches.size());
     for (const auto& candidates : knn_matches)
     {
         if (candidates.size() < 2)
@@ -268,14 +282,11 @@ std::vector<std::pair<int, int>> Matcher::matchDescriptors(const cv::Mat& query_
 
         const cv::DMatch& best_match = candidates[0];
         const cv::DMatch& second_match = candidates[1];
-
-        if (!isMatchValid(best_match, second_match))
-            continue;
-
-        match_indices.emplace_back(best_match.queryIdx, best_match.trainIdx);
+        if (isMatchValid(best_match, second_match))
+            matches.push_back(best_match);
     }
 
-    return match_indices;
+    return matches;
 }
 
 std::vector<std::pair<int, int>> Matcher::matchFramesByBoW(const Frame& ref_frame, 

@@ -167,6 +167,7 @@ void MapPoint::addObservation(const std::shared_ptr<Feature>& feature)
     }
 
     observations_.push_back(feature);
+    ++observation_generation_;
 }
 
 bool MapPoint::removeObservation(const std::shared_ptr<Feature>& feature)
@@ -193,6 +194,9 @@ bool MapPoint::removeObservation(const std::shared_ptr<Feature>& feature)
 
         it++;
     }
+
+    if (removed)
+        ++observation_generation_;
 
     return removed;
 }
@@ -257,6 +261,7 @@ void MapPoint::setBad(bool is_bad)
             return;
 
         is_bad_ = true;
+        ++observation_generation_;
 
         observations.reserve(observations_.size());
         for (const auto& obs : observations_)
@@ -360,6 +365,78 @@ std::vector<std::shared_ptr<Feature>> MapPoint::getKeyframeObservations(
         keyframe_observations.end());
 
     return keyframe_observations;
+}
+
+std::vector<std::shared_ptr<Frame>> MapPoint::getKeyframeObservationFrames(
+    const std::shared_ptr<Frame>& exclude_frame) const
+{
+    std::vector<std::shared_ptr<Feature>> observations;
+    std::size_t observation_generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(observation_mutex_);
+        observation_generation = observation_generation_;
+        if (keyframe_cache_generation_ == observation_generation_)
+        {
+            std::vector<std::shared_ptr<Frame>> cached_frames;
+            cached_frames.reserve(keyframe_observation_frame_cache_.size());
+            for (const auto& cached_frame : keyframe_observation_frame_cache_)
+            {
+                const std::shared_ptr<Frame> frame = cached_frame.lock();
+                if (frame != nullptr &&
+                    (exclude_frame == nullptr || frame != exclude_frame))
+                {
+                    cached_frames.push_back(frame);
+                }
+            }
+            return cached_frames;
+        }
+
+        observations.reserve(observations_.size());
+        for (const auto& obs : observations_)
+        {
+            const std::shared_ptr<Feature> feature = obs.lock();
+            if (feature != nullptr)
+                observations.push_back(feature);
+        }
+    }
+
+    std::vector<std::shared_ptr<Frame>> keyframe_frames;
+    keyframe_frames.reserve(observations.size());
+    std::unordered_set<std::size_t> observed_keyframe_ids;
+    observed_keyframe_ids.reserve(observations.size());
+
+    // Keep the reverse-link validation and keyframe de-duplication identical
+    // to getKeyframeObservations(), while avoiding a second Frame lookup in
+    // Frame::updateConnections().
+    for (const auto& feature : observations)
+    {
+        if (feature == nullptr || feature->getMapPoint().get() != this)
+            continue;
+
+        const std::shared_ptr<Frame> frame = feature->getFrame();
+        if (frame == nullptr || !frame->isKeyframe() ||
+            (exclude_frame != nullptr && frame == exclude_frame))
+        {
+            continue;
+        }
+
+        if (observed_keyframe_ids.insert(frame->getId()).second)
+            keyframe_frames.push_back(frame);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(observation_mutex_);
+        if (observation_generation_ == observation_generation)
+        {
+            keyframe_observation_frame_cache_.clear();
+            keyframe_observation_frame_cache_.reserve(keyframe_frames.size());
+            for (const auto& frame : keyframe_frames)
+                keyframe_observation_frame_cache_.push_back(frame);
+            keyframe_cache_generation_ = observation_generation;
+        }
+    }
+
+    return keyframe_frames;
 }
 
 std::shared_ptr<Feature> MapPoint::selectRefFeatureCandidate() const
@@ -580,6 +657,13 @@ cv::Mat MapPoint::getRepresentativeDescriptor() const
 {
     std::lock_guard<std::mutex> lock(tracking_state_mutex_);
     return representative_descriptor_.clone();
+}
+
+bool MapPoint::getRepresentativeDescriptorView(cv::Mat& descriptor) const
+{
+    std::lock_guard<std::mutex> lock(tracking_state_mutex_);
+    descriptor = representative_descriptor_;
+    return !descriptor.empty();
 }
 
 cv::Point3d MapPoint::getNormalVector() const

@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <unordered_set>
 #include <unordered_map>
+#include <chrono>
 #include <opencv2/calib3d.hpp>
 
 #include <g2o/core/robust_kernel_impl.h>
@@ -878,7 +880,7 @@ std::vector<std::shared_ptr<MapPoint>> PoseOptimizer::collectLocalBAMapPoints(
 
         for (const auto& feature : keyframe->getFeatures())
         {
-            if (feature == nullptr || !feature->getMapPoint())
+            if (feature == nullptr)
                 continue;
 
             const std::shared_ptr<MapPoint> map_point = feature->getMapPoint();
@@ -895,7 +897,10 @@ std::vector<std::shared_ptr<MapPoint>> PoseOptimizer::collectLocalBAMapPoints(
 
 std::vector<std::shared_ptr<Frame>> PoseOptimizer::collectFixedBAKeyframes(
     const std::vector<std::shared_ptr<Frame>>& local_keyframes,
-    const std::vector<std::shared_ptr<MapPoint>>& local_map_points) const
+    const std::vector<std::shared_ptr<MapPoint>>& local_map_points,
+    const std::unordered_map<std::size_t,
+                             std::vector<std::shared_ptr<Feature>>>&
+        map_point_observation_snapshots) const
 {
     std::vector<std::shared_ptr<Frame>> fixed_keyframes;
     std::unordered_set<std::size_t> local_keyframe_ids;
@@ -915,8 +920,11 @@ std::vector<std::shared_ptr<Frame>> PoseOptimizer::collectFixedBAKeyframes(
         if (map_point == nullptr || map_point->isBad())
             continue;
 
-        const std::vector<std::shared_ptr<Feature>> observations = 
-        map_point->getKeyframeObservations();
+        const auto snapshot_it = map_point_observation_snapshots.find(map_point->getId());
+        if (snapshot_it == map_point_observation_snapshots.end())
+            continue;
+
+        const auto& observations = snapshot_it->second;
 
         for (const auto& feature : observations)
         {
@@ -941,17 +949,17 @@ std::vector<std::shared_ptr<Frame>> PoseOptimizer::collectFixedBAKeyframes(
 std::vector<PoseOptimizer::LocalBAObservation> PoseOptimizer::collectLocalBAObservations(
     const std::vector<std::shared_ptr<Frame>>& local_keyframes,
     const std::vector<std::shared_ptr<Frame>>& fixed_keyframes,
-    const std::vector<std::shared_ptr<MapPoint>>& local_map_points) const
+    const std::vector<std::shared_ptr<MapPoint>>& local_map_points,
+    const std::unordered_map<std::size_t,
+                             std::vector<std::shared_ptr<Feature>>>&
+        map_point_observation_snapshots) const
 {
     std::vector<LocalBAObservation> observations;
 
     std::unordered_set<std::size_t> local_keyframe_ids;
     std::unordered_set<std::size_t> fixed_keyframe_ids;
-    std::unordered_set<std::size_t> local_map_point_ids;
-
     local_keyframe_ids.reserve(local_keyframes.size() * 2 + 1);
     fixed_keyframe_ids.reserve(fixed_keyframes.size() * 2 + 1);
-    local_map_point_ids.reserve(local_map_points.size() * 2 + 1);
 
     for (const auto& keyframe : local_keyframes)
     {
@@ -965,16 +973,13 @@ std::vector<PoseOptimizer::LocalBAObservation> PoseOptimizer::collectLocalBAObse
             fixed_keyframe_ids.insert(keyframe->getId());
     }
 
-    for (const auto& map_point : local_map_points)
-    {
-        if (map_point != nullptr && !map_point->isBad())
-            local_map_point_ids.insert(map_point->getId());
-    }
-
-    std::vector<LocalBAObservation> candidate_observations;
     std::unordered_map<std::size_t, int> observation_count_by_point;
 
-    candidate_observations.reserve(local_map_points.size() * 4);
+    // Keep the observation order identical to the previous candidate/filter
+    // path, but build the final vector only once.  Local BA is invoked for
+    // every admitted keyframe, so copying the complete edge set here becomes
+    // increasingly expensive as the map grows.
+    observations.reserve(local_map_points.size() * 4);
     observation_count_by_point.reserve(local_map_points.size() * 2 + 1);
 
     for (const auto& map_point : local_map_points)
@@ -982,8 +987,11 @@ std::vector<PoseOptimizer::LocalBAObservation> PoseOptimizer::collectLocalBAObse
         if (map_point == nullptr || map_point->isBad())
             continue;
 
-        const std::vector<std::shared_ptr<Feature>> keyframe_observations = 
-            map_point->getKeyframeObservations();
+        const auto snapshot_it = map_point_observation_snapshots.find(map_point->getId());
+        if (snapshot_it == map_point_observation_snapshots.end())
+            continue;
+
+        const auto& keyframe_observations = snapshot_it->second;
 
         for (const auto& feature : keyframe_observations)
         {
@@ -1001,35 +1009,34 @@ std::vector<PoseOptimizer::LocalBAObservation> PoseOptimizer::collectLocalBAObse
             if (!in_local && !in_fixed)
                 continue;
 
-            if (local_map_point_ids.count(map_point->getId()) == 0)
-                continue;
-
             LocalBAObservation observation;
             observation.keyframe = keyframe;
-            observation.map_point = map_point;
             observation.map_point = map_point;
             observation.feature = feature;
             observation.img_point = feature->getKeyPoint().pt;
             observation.feature_level = feature->getLevel();
 
-            candidate_observations.push_back(observation);
+            observations.push_back(observation);
             observation_count_by_point[map_point->getId()]++;
         }
     }
 
-    observations.reserve(candidate_observations.size());
+    // ORB-SLAM2 only creates a point vertex when it has at least two valid
+    // observations in the local BA graph.  Remove under-constrained points
+    // in place, preserving the exact edge order for all retained points.
+    observations.erase(
+        std::remove_if(observations.begin(), observations.end(),
+                       [&observation_count_by_point](const LocalBAObservation& observation)
+                       {
+                           if (observation.map_point == nullptr)
+                               return true;
 
-    for (const auto& observation : candidate_observations)
-    {
-        if (observation.map_point == nullptr)
-            continue;
-
-        const auto count_it = observation_count_by_point.find(observation.map_point->getId());
-        if (count_it == observation_count_by_point.end() || count_it->second < 2)
-            continue;
-
-        observations.push_back(observation);
-    }
+                           const auto count_it = observation_count_by_point.find(
+                               observation.map_point->getId());
+                           return count_it == observation_count_by_point.end() ||
+                                  count_it->second < 2;
+                       }),
+        observations.end());
 
     return observations;
 }
@@ -1048,12 +1055,26 @@ PoseOptimizer::LocalBAContext PoseOptimizer::buildLocalBAContext(
         return context;
 
     context.local_map_points = collectLocalBAMapPoints(context.local_keyframes);
+
+    context.map_point_observation_snapshots.reserve(context.local_map_points.size() * 2 + 1);
+    for (const auto& map_point : context.local_map_points)
+    {
+        if (map_point == nullptr || map_point->isBad())
+            continue;
+
+        context.map_point_observation_snapshots.emplace(
+            map_point->getId(), map_point->getKeyframeObservations());
+    }
+
     context.fixed_keyframes = 
-        collectFixedBAKeyframes(context.local_keyframes, context.local_map_points);
+        collectFixedBAKeyframes(context.local_keyframes,
+                                context.local_map_points,
+                                context.map_point_observation_snapshots);
 
     context.observations = collectLocalBAObservations(context.local_keyframes,
                                                       context.fixed_keyframes,
-                                                      context.local_map_points);
+                                                      context.local_map_points,
+                                                      context.map_point_observation_snapshots);
 
     if (context.observations.empty())
         return context;
@@ -1858,8 +1879,7 @@ InitialMapOptimizationResult PoseOptimizer::optimizeInitialMap(const std::shared
 
 LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map, 
                                               const std::shared_ptr<Frame>& cur_keyframe,
-                                              const PnPResult& tracking_seed,
-                                              bool* abort_flag) const
+                                              const PnPResult& tracking_seed) const
 {
     LocalBAResult result;
 
@@ -1868,6 +1888,7 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
         return result;
     }
 
+    const auto context_start = std::chrono::steady_clock::now();
     LocalBAContext context;
     {
         std::lock_guard<std::mutex> map_lock(map->getMutex());
@@ -1875,6 +1896,30 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
             return result;
 
         context = buildLocalBAContext(map, cur_keyframe);
+    }
+
+    result.context_build_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - context_start).count();
+    result.local_keyframe_num = context.local_keyframes.size();
+    result.fixed_keyframe_num = context.fixed_keyframes.size();
+    result.local_map_point_num = context.local_map_points.size();
+    result.observation_num = context.observations.size();
+
+    std::unordered_map<std::size_t, std::size_t> ba_edges_by_map_point;
+    ba_edges_by_map_point.reserve(context.local_map_points.size() * 2 + 1);
+    for (const auto& observation : context.observations)
+    {
+        if (observation.map_point != nullptr)
+            ba_edges_by_map_point[observation.map_point->getId()]++;
+    }
+    for (const auto& entry : ba_edges_by_map_point)
+    {
+        if (entry.second == 2)
+            result.map_points_with_2_ba_edges++;
+        else if (entry.second == 3)
+            result.map_points_with_3_ba_edges++;
+        else if (entry.second >= 4)
+            result.map_points_with_4_or_more_ba_edges++;
     }
 
     if (context.local_keyframes.size() < 3 ||
@@ -1900,6 +1945,7 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
         return result;
     }
 
+    const auto graph_build_start = std::chrono::steady_clock::now();
     using BlockSolverType = g2o::BlockSolver<g2o::BlockSolverTraits<6, 3>>;
     using LinearSolverType = g2o::LinearSolverEigen<BlockSolverType::PoseMatrixType>;
 
@@ -1908,8 +1954,6 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
 
     g2o::SparseOptimizer optimizer;
     optimizer.setVerbose(false);
-    if (abort_flag != nullptr)
-        optimizer.setForceStopFlag(abort_flag);
     optimizer.setAlgorithm(new g2o::OptimizationAlgorithmLevenberg(std::move(block_solver)));
 
     int next_vertex_id = 0;
@@ -2097,18 +2141,15 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
         return result;
 
     result.edge_num = graph_edges.size();
+    result.graph_build_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - graph_build_start).count();
 
+    const auto solve_start = std::chrono::steady_clock::now();
     if (!optimizer.initializeOptimization(0))
         return result;
 
     if (optimizer.optimize(5) <= 0)
         return result;
-
-    if (abort_flag != nullptr && *abort_flag)
-    {
-        result.rejection_reason = "ba_aborted_new_keyframe";
-        return result;
-    }
 
     optimizer.computeActiveErrors();
 
@@ -2129,15 +2170,11 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
     if (optimizer.optimize(10) <= 0)
         return result;
 
-    if (abort_flag != nullptr && *abort_flag)
-    {
-        result.rejection_reason = "ba_aborted_new_keyframe";
-        return result;
-    }
-
     optimizer.computeActiveErrors();
 
     result.solver_success = true;
+    result.solve_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - solve_start).count();
 
     for (const auto& graph_edge : graph_edges)
     {
@@ -2224,6 +2261,7 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
     if (current_pose_it == optimized_poses.end())
         return result;
 
+    const auto validation_start = std::chrono::steady_clock::now();
     const bool candidate_accepted = validateLocalBACandidate(
         tracking_seed,
         current_pose_it->R_cw,
@@ -2231,6 +2269,8 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
         candidate_map_point_positions,
         result.seed_reproj_error,
         result.candidate_seed_reproj_error);
+    result.validation_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - validation_start).count();
 
     if (!candidate_accepted)
     {
@@ -2240,22 +2280,11 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
 
     // The expensive solve used only the immutable context above. Re-enter the
     // map transaction only to validate and publish a complete candidate.
-    if (abort_flag != nullptr && *abort_flag)
-    {
-        result.rejection_reason = "ba_aborted_new_keyframe";
-        return result;
-    }
-
+    const auto commit_start = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> map_lock(map->getMutex());
     if (map->getVersion() != context.map_version || !cur_keyframe->isKeyframe())
     {
         result.rejection_reason = "stale_map_snapshot";
-        return result;
-    }
-
-    if (abort_flag != nullptr && *abort_flag)
-    {
-        result.rejection_reason = "ba_aborted_new_keyframe";
         return result;
     }
 
@@ -2273,8 +2302,18 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
     std::unordered_set<std::size_t> touched_map_point_ids;
     touched_map_point_ids.reserve(context.local_map_points.size() * 2 + 1);
 
+    // A BA pose/position update does not change a MapPoint's descriptor.  The
+    // descriptor only needs recomputation when this transaction removes an
+    // observation.  ORB-SLAM2's Local BA follows the same separation: it
+    // refreshes geometric normal/depth state for optimized points, while
+    // distinctive descriptors are maintained when observations change.
     std::vector<std::shared_ptr<MapPoint>> touched_map_points;
     touched_map_points.reserve(graph_edges.size());
+
+    std::vector<std::shared_ptr<Frame>> detached_observation_owners;
+    detached_observation_owners.reserve(graph_edges.size());
+    std::unordered_set<std::size_t> detached_observation_owner_ids;
+    detached_observation_owner_ids.reserve(graph_edges.size());
 
     for (const auto& graph_edge : graph_edges)
     {
@@ -2291,6 +2330,13 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
                 feature->getMapPoint() != map_point)
             {
                 continue;
+            }
+
+            const std::shared_ptr<Frame> owner_keyframe = feature->getFrame();
+            if (owner_keyframe != nullptr && owner_keyframe->isKeyframe() &&
+                detached_observation_owner_ids.insert(owner_keyframe->getId()).second)
+            {
+                detached_observation_owners.push_back(owner_keyframe);
             }
 
             feature->setMapPoint(nullptr);
@@ -2312,34 +2358,83 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
 
     map->removeBadMapPoints();
 
+    const auto view_statistics_start = std::chrono::steady_clock::now();
     for (const auto& map_point : context.local_map_points)
     {
         if (map_point == nullptr || map_point->isBad())
             continue;
 
         map_point->updateViewStatistics(scale_factor_, levels_num_);
+    }
+    result.view_statistics_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - view_statistics_start).count();
+
+    const auto descriptor_refresh_start = std::chrono::steady_clock::now();
+    // Only MapPoints whose observations were actually detached can have a
+    // changed representative descriptor. Iterate that compact set directly
+    // instead of rescanning the entire local BA point set and hashing IDs.
+    for (const auto& map_point : touched_map_points)
+    {
+        if (map_point == nullptr || map_point->isBad())
+        {
+            continue;
+        }
+
         map_point->updateRepresentativeDescriptor();
+        result.descriptor_refresh_num++;
+    }
+    result.descriptor_refresh_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - descriptor_refresh_start).count();
+
+    // R110-A: rebuild exactly the topology touched by BA observation removal.
+    // Connections must be refreshed before selecting neighbors; otherwise the
+    // old R112 ordering can miss a newly affected covisibility endpoint.
+    std::vector<std::shared_ptr<Frame>> topology_keyframes;
+    std::unordered_set<std::size_t> topology_keyframe_ids;
+    std::unordered_set<std::size_t> topology_connections_refreshed;
+    topology_keyframe_ids.reserve(detached_observation_owners.size() * 8 + 1);
+    topology_connections_refreshed.reserve(detached_observation_owners.size() + 1);
+    for (const auto& owner_keyframe : detached_observation_owners)
+    {
+        if (owner_keyframe == nullptr || !owner_keyframe->isKeyframe())
+            continue;
+
+        owner_keyframe->updateConnections();
+        topology_connections_refreshed.insert(owner_keyframe->getId());
+        if (topology_keyframe_ids.insert(owner_keyframe->getId()).second)
+            topology_keyframes.push_back(owner_keyframe);
+
+        const std::vector<std::shared_ptr<Frame>> neighbors =
+            owner_keyframe->getConnectedKeyframes(5);
+        for (const auto& neighbor : neighbors)
+        {
+            if (neighbor != nullptr && neighbor->isKeyframe() &&
+                topology_keyframe_ids.insert(neighbor->getId()).second)
+            {
+                topology_keyframes.push_back(neighbor);
+            }
+        }
     }
 
-    for (const auto& keyframe : context.local_keyframes)
+    for (const auto& keyframe : topology_keyframes)
     {
         if (keyframe == nullptr || !keyframe->isKeyframe())
             continue;
-
-        keyframe->updateConnections();
-        map->recordCovisibilityConstraints(keyframe);
-    }
-
-    for (const auto& keyframe : context.fixed_keyframes)
-    {
-        if (keyframe == nullptr || !keyframe->isKeyframe())
+        if (topology_connections_refreshed.count(keyframe->getId()) > 0)
             continue;
-
         keyframe->updateConnections();
-        map->recordCovisibilityConstraints(keyframe);
     }
+
+    map->reconcileCovisibilityConstraints(topology_keyframes);
+
+    // R110-B: only Local BA-optimized poses can invalidate the relative
+    // measurement. Map indexes restrict this operation to their incident
+    // sequential/covisibility edges; Loop Closing retains full refreshes.
+    map->refreshPoseGraphMeasurements(context.local_keyframes);
 
     map->markModified();
+    result.commit_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - commit_start).count();
 
     return result;
 }
