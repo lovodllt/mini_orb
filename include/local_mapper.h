@@ -45,10 +45,11 @@ public:
                              const std::shared_ptr<KeyframeDatabase>& database);
     void setLoopCloser(LoopCloser* loop_closer);
 
-    // At most one keyframe can be waiting behind the worker.  This is an
-    // admission gate, not a bounded FIFO: a frame is either atomically
-    // admitted or remains a normal tracking frame.
+    // A small FIFO absorbs transient Local BA bursts without allowing
+    // unbounded tracking-to-mapping backlog.
     bool insertKeyframe(const LocalMappingInput& input);
+    std::shared_ptr<Frame> getLatestScheduledKeyframe(
+        const std::shared_ptr<Map>& map) const;
     bool hasPendingKeyframe() const;
     bool tryPopFinishedResult(LocalMappingOutput& output);
     bool waitPopFinishedResult(LocalMappingOutput& output);
@@ -87,8 +88,18 @@ private:
         const std::shared_ptr<Frame>& ref_frame,
         const std::shared_ptr<Frame>& cur_frame) const;
 
+    struct TriangulationMatchCache
+    {
+        std::shared_ptr<Frame> ref_keyframe;
+        std::vector<cv::DMatch> raw_matches;
+    };
+
+    std::vector<TriangulationMatchCache> collectTriangulationMatchCache(
+        const std::vector<std::shared_ptr<Frame>>& triangulation_keyframes,
+        const std::shared_ptr<Frame>& cur_keyframe) const;
+
     std::size_t growMapByKeyFrames(const std::shared_ptr<Map>& map,
-                                   const std::shared_ptr<Frame>& ref_keyframe,
+                                   const std::vector<TriangulationMatchCache>& match_cache,
                                    const std::shared_ptr<Frame>& cur_keyframe,
                                    std::size_t current_local_mapping_generation,
                                    LocalMappingResult* result) const;
@@ -96,6 +107,7 @@ private:
     std::size_t growMapByKeyFramePair(const std::shared_ptr<Map>& map,
                                       const std::shared_ptr<Frame>& ref_keyframe,
                                       const std::shared_ptr<Frame>& cur_keyframe,
+                                      const std::vector<cv::DMatch>& raw_matches,
                                       std::size_t current_local_mapping_generation,
                                       LocalMappingResult* result) const;
 
@@ -189,6 +201,10 @@ private:
     std::deque<LocalMappingInput> pending_keyframes_;
     std::deque<LocalMappingOutput> finished_results_;
     std::thread worker_thread_;
+
+    static constexpr std::size_t kMaxPendingKeyframes = 2;
+    std::weak_ptr<Map> latest_scheduled_map_;
+    std::weak_ptr<Frame> latest_scheduled_keyframe_;
 
     mutable bool accept_keyframes_{true};
     mutable bool stop_requested_{false};

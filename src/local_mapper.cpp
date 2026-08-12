@@ -279,7 +279,7 @@ struct TriangulationMatchDiagnostics
 };
 
 std::vector<std::pair<int, int>> collectTriangulationMatches(
-    const Matcher& matcher,
+    const std::vector<cv::DMatch>& raw_matches,
     const std::shared_ptr<Frame>& ref_keyframe,
     const std::shared_ptr<Frame>& cur_keyframe,
     const cv::Matx33d& F_21,
@@ -301,9 +301,6 @@ std::vector<std::pair<int, int>> collectTriangulationMatches(
     // the global ratio-filtered BF matches, then applies occupancy, epipolar,
     // and orientation tests below. The distance is carried through from BF so
     // this second-stage filtering does not repeat descriptor comparisons.
-    const std::vector<cv::DMatch> raw_matches =
-        matcher.matchDescriptorsWithDistance(ref_keyframe->getDescriptors(),
-                                             cur_keyframe->getDescriptors());
     if (diagnostics != nullptr)
         diagnostics->raw_matches = raw_matches.size();
     if (raw_matches.empty())
@@ -509,6 +506,8 @@ void LocalMapper::start()
     stop_requested_ = false;
     stopped_ = false;
     accept_keyframes_ = true;
+    latest_scheduled_map_.reset();
+    latest_scheduled_keyframe_.reset();
     worker_started_ = true;
 
     worker_thread_ = std::thread(&LocalMapper::run, this);
@@ -550,7 +549,7 @@ void LocalMapper::release()
         std::lock_guard<std::mutex> lock(queue_mutex_);
         stop_requested_ = false;
         stopped_ = false;
-        accept_keyframes_ = pending_keyframes_.empty() && finished_results_.empty();
+        accept_keyframes_ = !finish_requested_;
     }
     queue_cv_.notify_all();
 }
@@ -565,19 +564,32 @@ bool LocalMapper::insertKeyframe(const LocalMappingInput& input)
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (!accept_keyframes_ || finish_requested_)
+        if (!accept_keyframes_ || finish_requested_ || stop_requested_)
             return false;
 
-        // A transaction must be consumed by Frontend before the next keyframe
-        // is admitted, keeping map topology in source-frame order.
-        if (!pending_keyframes_.empty() || !finished_results_.empty())
+        if (pending_keyframes_.size() >= kMaxPendingKeyframes)
             return false;
 
         pending_keyframes_.push_back(input);
+        latest_scheduled_map_ = input.map;
+        latest_scheduled_keyframe_ = input.cur_keyframe;
     }
 
     queue_cv_.notify_one();
     return true;
+}
+
+std::shared_ptr<Frame> LocalMapper::getLatestScheduledKeyframe(
+    const std::shared_ptr<Map>& map) const
+{
+    if (map == nullptr)
+        return nullptr;
+
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    if (latest_scheduled_map_.lock() != map)
+        return nullptr;
+
+    return latest_scheduled_keyframe_.lock();
 }
 
 bool LocalMapper::hasPendingKeyframe() const
@@ -602,8 +614,7 @@ bool LocalMapper::waitPopFinishedResult(LocalMappingOutput& output)
     std::unique_lock<std::mutex> lock(queue_mutex_);
     queue_cv_.wait(lock, [this]()
     {
-        return finish_requested_ || !finished_results_.empty() ||
-               (accept_keyframes_ && pending_keyframes_.empty() && !stop_requested_);
+        return finish_requested_ || !finished_results_.empty();
     });
 
     if (finished_results_.empty())
@@ -617,13 +628,10 @@ bool LocalMapper::waitPopFinishedResult(LocalMappingOutput& output)
 bool LocalMapper::acceptKeyframe() const
 {
     std::lock_guard<std::mutex> lock(queue_mutex_);
-    // A completed transaction must be consumed before the next keyframe is
-    // admitted. This defines the synchronous accuracy-reference contract.
     return accept_keyframes_ &&
            !finish_requested_ &&
            !stop_requested_ &&
-           pending_keyframes_.empty() &&
-           finished_results_.empty();
+           pending_keyframes_.size() < kMaxPendingKeyframes;
 }
 
 bool LocalMapper::isStopped() const
@@ -681,7 +689,6 @@ void LocalMapper::run()
                 continue;
             }
 
-            accept_keyframes_ = false;
             stopped_ = false;
 
             input = pending_keyframes_.front();
@@ -707,7 +714,6 @@ void LocalMapper::run()
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
             finished_results_.push_back(std::move(output));
-            accept_keyframes_ = true;
         }
         queue_cv_.notify_all();
     }
@@ -774,6 +780,8 @@ LocalMappingResult LocalMapper::processNewKeyframe(const std::shared_ptr<Map>& m
     double fusion_reference_graph_ms = 0.0;
     double keyframe_cull_ms = 0.0;
     std::size_t fused_map_point_num = 0;
+    std::size_t current_local_mapping_generation = 0;
+    std::vector<std::shared_ptr<Frame>> triangulation_keyframes;
     {
         const auto map_lock_start = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> map_lock(map->getMutex());
@@ -789,7 +797,7 @@ LocalMappingResult LocalMapper::processNewKeyframe(const std::shared_ptr<Map>& m
         const auto keyframe_commit_start = std::chrono::steady_clock::now();
         map->addKeyframe(cur_keyframe);
 
-        const std::size_t current_local_mapping_generation = local_mapping_generation_++;
+        current_local_mapping_generation = local_mapping_generation_++;
 
         processCurrentKeyframeMapPoints(cur_keyframe);
         updateCovisibilityGraph(map, cur_keyframe);
@@ -801,16 +809,33 @@ LocalMappingResult LocalMapper::processNewKeyframe(const std::shared_ptr<Map>& m
         map_point_cull_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - map_point_cull_start).count();
 
+        triangulation_keyframes = collectTriangulationKeyframes(ref_keyframe, cur_keyframe);
+    }
+
+    // Keyframe descriptors are immutable after frame construction. Keep the
+    // expensive BF KNN query outside Map::mutex_, then re-enter the map
+    // transaction for all topology-dependent validation and commits.
+    const auto descriptor_match_start = std::chrono::steady_clock::now();
+    const std::vector<TriangulationMatchCache> triangulation_match_cache =
+        collectTriangulationMatchCache(triangulation_keyframes, cur_keyframe);
+    result.triangulation_match_duration_ms +=
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - descriptor_match_start).count();
+
+    {
+        const auto map_lock_start = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> map_lock(map->getMutex());
+        map_lock_wait_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - map_lock_start).count();
         const auto triangulation_start = std::chrono::steady_clock::now();
         result.new_map_point_num =
             growMapByKeyFrames(map,
-                               ref_keyframe,
+                               triangulation_match_cache,
                                cur_keyframe,
                                current_local_mapping_generation,
                                &result);
         triangulation_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - triangulation_start).count();
-
     }
 
     LocalBAResult local_ba_result;
@@ -855,10 +880,9 @@ LocalMappingResult LocalMapper::processNewKeyframe(const std::shared_ptr<Map>& m
             }
             else if (!stop_requested_ && !finish_requested_)
             {
-                // A BA/cull transaction mutates map state.  Close admission
-                // before it begins so an admitted seed cannot span that
-                // mutation.  We intentionally do not interrupt g2o mid-solve.
-                accept_keyframes_ = false;
+                // R156 keeps the bounded FIFO open while Local BA runs.
+                // A new keyframe is retained in source order and causes the
+                // next mapping transaction to yield its convergence work.
                 run_convergence = true;
             }
         }
@@ -1293,28 +1317,51 @@ std::vector<std::shared_ptr<Frame>> LocalMapper::collectTriangulationKeyframes(
     return result;
 }
 
+std::vector<LocalMapper::TriangulationMatchCache>
+LocalMapper::collectTriangulationMatchCache(
+    const std::vector<std::shared_ptr<Frame>>& triangulation_keyframes,
+    const std::shared_ptr<Frame>& cur_keyframe) const
+{
+    std::vector<TriangulationMatchCache> match_cache;
+    if (cur_keyframe == nullptr || !cur_keyframe->hasFeatures())
+        return match_cache;
+
+    match_cache.reserve(triangulation_keyframes.size());
+    for (const std::shared_ptr<Frame>& ref_keyframe : triangulation_keyframes)
+    {
+        if (ref_keyframe == nullptr || !ref_keyframe->hasFeatures())
+            continue;
+
+        TriangulationMatchCache cache;
+        cache.ref_keyframe = ref_keyframe;
+        cache.raw_matches = matcher_.matchDescriptorsWithDistance(
+            ref_keyframe->getDescriptors(), cur_keyframe->getDescriptors());
+        match_cache.push_back(std::move(cache));
+    }
+
+    return match_cache;
+}
+
 std::size_t LocalMapper::growMapByKeyFrames(const std::shared_ptr<Map>& map, 
-                                            const std::shared_ptr<Frame>& ref_keyframe, 
+                                            const std::vector<TriangulationMatchCache>& match_cache,
                                             const std::shared_ptr<Frame>& cur_keyframe,
                                             std::size_t current_local_mapping_generation,
                                             LocalMappingResult* result) const
 {   
-    if (map == nullptr || ref_keyframe == nullptr || cur_keyframe == nullptr || initializer_ == nullptr)
+    if (map == nullptr || cur_keyframe == nullptr || initializer_ == nullptr)
         return 0;
 
-    const std::vector<std::shared_ptr<Frame>> triangulation_keyframes = 
-        collectTriangulationKeyframes(ref_keyframe, cur_keyframe);
-
     if (result != nullptr)
-        result->triangulation_partner_num += triangulation_keyframes.size();
+        result->triangulation_partner_num += match_cache.size();
 
     std::size_t created_map_points_num = 0;
 
-    for (const auto& neighbpr_keyframe : triangulation_keyframes)
+    for (const TriangulationMatchCache& cache : match_cache)
     {
         created_map_points_num += growMapByKeyFramePair(map, 
-                                                        neighbpr_keyframe, 
+                                                        cache.ref_keyframe,
                                                         cur_keyframe, 
+                                                        cache.raw_matches,
                                                         current_local_mapping_generation,
                                                         result);
     }
@@ -1325,6 +1372,7 @@ std::size_t LocalMapper::growMapByKeyFrames(const std::shared_ptr<Map>& map,
 std::size_t LocalMapper::growMapByKeyFramePair(const std::shared_ptr<Map>& map,
                                                const std::shared_ptr<Frame>& ref_keyframe,
                                                const std::shared_ptr<Frame>& cur_keyframe,
+                                               const std::vector<cv::DMatch>& raw_matches,
                                                std::size_t current_local_mapping_generation,
                                                LocalMappingResult* result) const
 {
@@ -1379,7 +1427,7 @@ std::size_t LocalMapper::growMapByKeyFramePair(const std::shared_ptr<Map>& map,
     TriangulationMatchDiagnostics match_diagnostics;
     const auto match_start = std::chrono::steady_clock::now();
     const std::vector<std::pair<int, int>> candidate_matches = 
-        collectTriangulationMatches(matcher_, ref_keyframe, cur_keyframe, F_21,
+        collectTriangulationMatches(raw_matches, ref_keyframe, cur_keyframe, F_21,
                                     scale_factor_, &match_diagnostics);
     if (result != nullptr)
     {

@@ -30,7 +30,7 @@ Local Mapper: triangulation -> fusion -> Local BA -> culling -> commit
         v                                                    v
 Map / covisibility graph <------------------------- pose-graph constraints
         |
-        v
+        v 
 Loop Closer: BoW retrieval -> geometric verification -> pose-graph optimization
 ```
 

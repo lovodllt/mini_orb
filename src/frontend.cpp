@@ -4,6 +4,7 @@
 #include <cmath>
 #include <unordered_map>
 #include <unordered_set>
+#include <mutex>
 #include <Eigen/Geometry>
 #include <geometry_msgs/PoseStamped.h>
 #include <std_msgs/UInt64.h>
@@ -112,6 +113,25 @@ bool Frontend::initImpl(bool enable_ros_transport)
     nh_.param("relocalization_guard_frames", relocalization_guard_frames_, relocalization_guard_frames_);
     nh_.param("vocabulary_path", vocabulary_path_, std::string(""));
     nh_.param("max_relocalization_candidates", max_relocalization_candidates_, max_relocalization_candidates_);
+    nh_.param("tracking_full_map_lock", tracking_full_map_lock_, tracking_full_map_lock_);
+    nh_.param("tracking_diagnostic_logging",
+              tracking_diagnostic_logging_,
+              tracking_diagnostic_logging_);
+    nh_.param("tracking_legacy_live_map",
+              tracking_legacy_live_map_,
+              tracking_legacy_live_map_);
+    nh_.param("deterministic_ransac_seed",
+              deterministic_ransac_seed_,
+              deterministic_ransac_seed_);
+    if (deterministic_ransac_seed_ >= 0)
+    {
+        cv::setRNGSeed(deterministic_ransac_seed_);
+        ROS_INFO_STREAM("P2-KITTI-DIAG-R176 deterministic_ransac_seed="
+                        << deterministic_ransac_seed_);
+    }
+    ROS_INFO_STREAM("P2-KITTI-DIAG-R173 tracking_lock_mode full="
+                    << (tracking_full_map_lock_ ? 1 : 0)
+                    << " legacy_live_map=" << (tracking_legacy_live_map_ ? 1 : 0));
 
     min_relocalization_inliers_ = std::max(min_recovery_inliers_, min_relocalization_inliers_);
 
@@ -175,7 +195,8 @@ bool Frontend::initImpl(bool enable_ros_transport)
                                          pose_optimizer_,
                                          orb_extractor_.getScaleFactor(),
                                          orb_extractor_.getLevelsNum(),
-                                         15.0f);
+                                         15.0f,
+                                         tracking_diagnostic_logging_);
 
     std::shared_ptr<Initializer> local_mapper_initializer = 
         std::make_shared<Initializer>(camera_);
@@ -1081,7 +1102,7 @@ bool Frontend::shouldInsertKeyframe(const std::shared_ptr<Map>& map,
     ROS_INFO_STREAM_THROTTLE(1.0,
         "P2-EUROC-PERF-R29 keyframe_decision total=" << keyframe_decision_num_
         << " busy_rejected=" << keyframe_busy_rejected_num_
-        << " commit_barrier=" << keyframe_commit_barrier_num_
+        << " queued=" << keyframe_queued_num_
         << " force_insert=" << keyframe_force_insert_num_
         << " weak_insert=" << keyframe_weak_insert_num_
         << " frame_gap=" << frame_gap
@@ -1604,7 +1625,12 @@ std::vector<std::shared_ptr<MapPoint>> Frontend::collectMapPointsFromKeyframes(
             if (feature == nullptr)
                 continue;
 
-            appendUniqueMapPoint(feature->getMapPoint(), map_points, map_point_ids);
+            const std::shared_ptr<MapPoint>& map_point = feature->getMapPoint();
+            if (map_point == nullptr || map_point->isBad())
+                continue;
+
+            if (map_point_ids.insert(map_point->getId()).second)
+                map_points.push_back(map_point);
         }
     }
 
@@ -1670,6 +1696,42 @@ std::vector<std::shared_ptr<MapPoint>> Frontend::collectLocalMapPoints(
                     << " obs_two_or_more=" << observation_count_two_or_more);
 
     return local_map_points;
+}
+
+Frontend::TrackingLocalContext Frontend::buildTrackingLocalContext(
+    const std::shared_ptr<Map>& map,
+    const TrackingResult& tracking_result) const
+{
+    TrackingLocalContext context;
+    if (map == nullptr || !tracking_result.success)
+        return context;
+
+    context.local_keyframes = collectLocalKeyframes(map, tracking_result);
+
+    std::unordered_set<std::size_t> local_map_point_ids;
+    local_map_point_ids.reserve(256);
+    context.local_map_points.reserve(256);
+
+    for (const auto& map_point : tracking_result.inlier_map_points)
+        appendUniqueMapPoint(map_point, context.local_map_points, local_map_point_ids);
+
+    for (const auto& keyframe : context.local_keyframes)
+    {
+        if (keyframe == nullptr)
+            continue;
+
+        for (const auto& feature : keyframe->getFeatures())
+        {
+            if (feature == nullptr)
+                continue;
+
+            appendUniqueMapPoint(feature->getMapPoint(),
+                                 context.local_map_points,
+                                 local_map_point_ids);
+        }
+    }
+
+    return context;
 }
 
 bool Frontend::predictCurrentPoseByMotionModel(const std::shared_ptr<Frame>& cur_frame)
@@ -1764,6 +1826,8 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
                                   int min_local_map_inliers,
                                   const cv::Mat& predicted_R,
                                   const cv::Mat& predicted_t,
+                                  const TrackingLocalContext* local_context,
+                                  bool map_lock_held,
                                   const std::shared_ptr<Frame>& cur_frame,
                                   PnPResult& pnp_result,
                                   TrackingResult& tracking_result,
@@ -1811,8 +1875,31 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
 
     cur_frame->setPose(seed_pnp_result.R, seed_pnp_result.tvec);
 
-    std::vector<std::shared_ptr<MapPoint>> candidate_local_map_points = 
-        collectLocalMapPoints(init_result_.map, seed_tracking_result);
+    const auto local_map_collect_start = std::chrono::steady_clock::now();
+    std::vector<std::shared_ptr<MapPoint>> candidate_local_map_points;
+    if (local_context != nullptr && !local_context->local_map_points.empty())
+    {
+        candidate_local_map_points = local_context->local_map_points;
+    }
+    else
+    {
+        // A failed snapshot must not reopen an unlocked live-map path. This
+        // fallback is uncommon, but its local-map traversal still needs a
+        // coherent container/observation view.
+        if (map_lock_held)
+        {
+            candidate_local_map_points = collectLocalMapPoints(init_result_.map,
+                                                                seed_tracking_result);
+        }
+        else
+        {
+            std::lock_guard<std::mutex> map_lock(init_result_.map->getMutex());
+            candidate_local_map_points = collectLocalMapPoints(init_result_.map,
+                                                                seed_tracking_result);
+        }
+    }
+    const double local_map_collect_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - local_map_collect_start).count();
 
     if (candidate_local_map_points.size() < 20)
     {
@@ -1832,8 +1919,11 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
                     << seed_tracking_result.inlier_map_points.size()
                     << " local_map_points=" << candidate_local_map_points.size());
 
-    const PnPResult refined_pnp_result = 
+    const auto local_refine_start = std::chrono::steady_clock::now();
+    const PnPResult refined_pnp_result =
         tracker_->refinePoseWithLocalMap(seed_pnp_result, candidate_local_map_points, cur_frame);
+    const double local_refine_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - local_refine_start).count();
 
     if (!refined_pnp_result.success)
     {
@@ -1844,8 +1934,11 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
         return false;
     }
 
-    const TrackingResult refined_tracking_result = 
+    const auto refined_association_start = std::chrono::steady_clock::now();
+    const TrackingResult refined_tracking_result =
         tracker_->buildTrackingResult(cur_frame, refined_pnp_result);
+    const double refined_association_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - refined_association_start).count();
 
     pnp_result = refined_pnp_result;
     tracking_result = refined_tracking_result;
@@ -1868,25 +1961,55 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
     if (!accepted)
         restorePredictedPose();
 
+    ROS_INFO_STREAM_THROTTLE(1.0,
+        "P2-KITTI-PERF-R163 tracking_refine_phases frame=" << cur_frame->getId()
+        << " local_map_collect_ms=" << local_map_collect_ms
+        << " local_refine_ms=" << local_refine_ms
+        << " refined_association_ms=" << refined_association_ms
+        << " local_map_points=" << candidate_local_map_points.size()
+        << " refined_candidates=" << refined_pnp_result.object_points.size()
+        << " accepted=" << (accepted ? 1 : 0));
+
     return accepted;
 }
 
 bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
                                  PnPResult& pnp_result,
                                  TrackingResult& tracking_result,
-                                 std::vector<std::shared_ptr<MapPoint>>& local_map_points)
+                                 std::vector<std::shared_ptr<MapPoint>>& local_map_points,
+                                 double& snapshot_lock_wait_ms,
+                                 double& snapshot_build_ms,
+                                 std::size_t& snapshot_count,
+                                 bool map_lock_held)
 {
     constexpr int kMinMotionModelInliers = 10;
 
     pnp_result = {};
     tracking_result = {};
     local_map_points.clear();
+    snapshot_lock_wait_ms = 0.0;
+    snapshot_build_ms = 0.0;
+    snapshot_count = 0;
 
     if (cur_frame == nullptr || init_result_.map == nullptr || 
         last_tracked_frame_ == nullptr || tracker_ == nullptr)
         return false;
 
     const auto tracking_start = std::chrono::steady_clock::now();
+    auto emitEarlyTrackingDiag = [&](const char* stage,
+                                     const PnPResult& seed_result)
+    {
+        if (cur_frame->getId() > 30)
+            return;
+
+        ROS_INFO_STREAM("P2-KITTI-DIAG-R174 frame=" << cur_frame->getId()
+                        << " stage=" << stage
+                        << " map_version=" << init_result_.map->getVersion()
+                        << " candidates=" << seed_result.object_points.size()
+                        << " inliers=" << seed_result.inlier_num
+                        << " success=" << (seed_result.success ? 1 : 0)
+                        << " reproj=" << seed_result.optimized_reproj_error);
+    };
     auto emitTiming = [&](const char* path,
                           double prediction_ms,
                           double seed_ms,
@@ -1900,6 +2023,19 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
             << " seed_ms=" << seed_ms
             << " refine_ms=" << refine_ms
             << " total_ms=" << total_ms);
+        if (cur_frame->getId() <= 30)
+        {
+            ROS_INFO_STREAM("P2-KITTI-DIAG-R174 frame=" << cur_frame->getId()
+                            << " stage=tracking_result"
+                            << " path=" << path
+                            << " map_version=" << init_result_.map->getVersion()
+                            << " candidates=" << pnp_result.object_points.size()
+                            << " inliers=" << pnp_result.inlier_num
+                            << " tracking_inliers="
+                            << tracking_result.inlier_map_points.size()
+                            << " success=" << (tracking_result.success ? 1 : 0)
+                            << " reproj=" << pnp_result.optimized_reproj_error);
+        }
     };
 
     const auto prediction_start = std::chrono::steady_clock::now();
@@ -1919,6 +2055,63 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
     // A post-recovery guard prevents immediate keyframe churn, but must not
     // raise the normal tracking inlier requirement to the relocalization one.
     const int required_local_inliers = min_tracking_inliers_;
+    auto snapshotLocalContext = [&](const PnPResult& seed_result,
+                                    TrackingLocalContext& local_context) -> bool
+    {
+        if (tracking_legacy_live_map_)
+            return false;
+
+        const auto snapshot_start = std::chrono::steady_clock::now();
+        if (!seed_result.success || seed_result.inlier_num < kMinMotionModelInliers)
+            return false;
+
+        const TrackingResult seed_tracking_result =
+            tracker_->buildTrackingResult(cur_frame, seed_result);
+        if (!seed_tracking_result.success ||
+            seed_tracking_result.inlier_map_points.size() < kMinMotionModelInliers)
+        {
+            return false;
+        }
+
+        cur_frame->setPose(seed_result.R, seed_result.tvec);
+        double lock_wait_ms = 0.0;
+        std::unique_lock<std::mutex> snapshot_lock;
+        if (!map_lock_held)
+        {
+            const auto lock_start = std::chrono::steady_clock::now();
+            snapshot_lock = std::unique_lock<std::mutex>(init_result_.map->getMutex());
+            lock_wait_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - lock_start).count();
+        }
+        const auto build_start = std::chrono::steady_clock::now();
+        local_context = buildTrackingLocalContext(init_result_.map, seed_tracking_result);
+        local_context.map_version = init_result_.map->getVersion();
+        const double snapshot_build_duration_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - build_start).count();
+        snapshot_lock_wait_ms += lock_wait_ms;
+        snapshot_build_ms += snapshot_build_duration_ms;
+        snapshot_count++;
+        ROS_INFO_STREAM_THROTTLE(1.0,
+            "P2-KITTI-PERF-R170 tracking_snapshot lock_wait_ms=" << lock_wait_ms
+            << " build_ms=" << snapshot_build_duration_ms
+            << " keyframes=" << local_context.local_keyframes.size()
+            << " map_points=" << local_context.local_map_points.size()
+            << " map_version=" << local_context.map_version);
+        if (cur_frame->getId() <= 30)
+        {
+            ROS_INFO_STREAM("P2-KITTI-DIAG-R174 frame=" << cur_frame->getId()
+                            << " stage=local_context"
+                            << " map_version=" << local_context.map_version
+                            << " local_keyframes=" << local_context.local_keyframes.size()
+                            << " local_map_points=" << local_context.local_map_points.size()
+                            << " seed_inliers=" << seed_result.inlier_num);
+        }
+        const double snapshot_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - snapshot_start).count();
+        ROS_DEBUG_STREAM("P2-KITTI-PERF-R170 tracking_snapshot_total frame="
+                         << cur_frame->getId() << " total_ms=" << snapshot_ms);
+        return !local_context.local_map_points.empty();
+    };
 
     const auto motion_seed_start = std::chrono::steady_clock::now();
     const PnPResult motion_pnp_result = 
@@ -1931,16 +2124,22 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
                     << motion_pnp_result.object_points.size()
                     << " inliers=" << motion_pnp_result.inlier_num
                     << " success=" << (motion_pnp_result.success ? 1 : 0));
+    emitEarlyTrackingDiag("motion_seed", motion_pnp_result);
 
     if (motion_pnp_result.success &&
         motion_pnp_result.inlier_num >= kMinMotionModelInliers)
     {
+        TrackingLocalContext motion_local_context;
+        const bool have_motion_context = snapshotLocalContext(motion_pnp_result,
+                                                              motion_local_context);
         const auto motion_refine_start = std::chrono::steady_clock::now();
         if (refineTrackingSeed(motion_pnp_result,
                                 kMinMotionModelInliers,
                                 required_local_inliers,
                                 predicted_R,
                                 predicted_t,
+                                have_motion_context ? &motion_local_context : nullptr,
+                                map_lock_held,
                                 cur_frame,
                                 pnp_result,
                                 tracking_result,
@@ -1963,12 +2162,18 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
                     << reference_frame_pnp_result.object_points.size()
                     << " inliers=" << reference_frame_pnp_result.inlier_num
                     << " success=" << (reference_frame_pnp_result.success ? 1 : 0));
+    emitEarlyTrackingDiag("reference_frame_seed", reference_frame_pnp_result);
+    TrackingLocalContext reference_frame_local_context;
+    const bool have_reference_frame_context = snapshotLocalContext(reference_frame_pnp_result,
+                                                                   reference_frame_local_context);
     const auto reference_frame_refine_start = std::chrono::steady_clock::now();
     if (refineTrackingSeed(reference_frame_pnp_result,
                             kMinMotionModelInliers,
                             required_local_inliers,
                             predicted_R,
                             predicted_t,
+                            have_reference_frame_context ? &reference_frame_local_context : nullptr,
+                            map_lock_held,
                             cur_frame,
                             pnp_result,
                             tracking_result,
@@ -1984,7 +2189,9 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
     std::shared_ptr<Frame> reference_keyframe = tracking_reference_keyframe_.lock();
 
     if (reference_keyframe == nullptr || !reference_keyframe->isKeyframe())
-        reference_keyframe = init_result_.map->copyLastKeyframe();
+        reference_keyframe = map_lock_held
+            ? init_result_.map->getLastKeyframe()
+            : init_result_.map->copyLastKeyframe();
 
     if (reference_keyframe == nullptr || !reference_keyframe->isKeyframe())
     {
@@ -2006,12 +2213,18 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
                     << " candidates=" << reference_pnp_result.object_points.size()
                     << " inliers=" << reference_pnp_result.inlier_num
                     << " success=" << (reference_pnp_result.success ? 1 : 0));
+    emitEarlyTrackingDiag("bow_seed", reference_pnp_result);
+    TrackingLocalContext bow_local_context;
+    const bool have_bow_context = snapshotLocalContext(reference_pnp_result,
+                                                       bow_local_context);
     const auto bow_refine_start = std::chrono::steady_clock::now();
     if (refineTrackingSeed(reference_pnp_result,
                             kMinMotionModelInliers,
                             required_local_inliers,
                             predicted_R,
                             predicted_t,
+                            have_bow_context ? &bow_local_context : nullptr,
+                            map_lock_held,
                             cur_frame,
                             pnp_result,
                             tracking_result,
@@ -2028,19 +2241,25 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
     // fallback; relocalization remains the separate recovery path.
     const auto map_seed_start = std::chrono::steady_clock::now();
     const PnPResult map_pnp_result =
-        tracker_->trackFrameByMap(init_result_.map, cur_frame, true);
+        tracker_->trackFrameByMap(init_result_.map, cur_frame, map_lock_held);
     const double map_seed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - map_seed_start).count();
     ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R18 frame=" << cur_frame->getId()
                     << " stage=map_seed candidates=" << map_pnp_result.object_points.size()
                     << " inliers=" << map_pnp_result.inlier_num
                     << " success=" << (map_pnp_result.success ? 1 : 0));
+    emitEarlyTrackingDiag("map_seed", map_pnp_result);
+    TrackingLocalContext map_local_context;
+    const bool have_map_context = snapshotLocalContext(map_pnp_result,
+                                                       map_local_context);
     const auto map_refine_start = std::chrono::steady_clock::now();
     const bool map_refined = refineTrackingSeed(map_pnp_result,
                                                  kMinMotionModelInliers,
                                                  required_local_inliers,
                                                  predicted_R,
                                                  predicted_t,
+                                                 have_map_context ? &map_local_context : nullptr,
+                                                 map_lock_held,
                                                  cur_frame,
                                                  pnp_result,
                                                  tracking_result,
@@ -2154,7 +2373,7 @@ bool Frontend::tryRelocalization(const std::shared_ptr<Frame>& cur_frame,
         cur_frame->setPose(backup_R, backup_t);
         
     PnPResult fallback_pnp_result =
-        tracker_->trackFrameByMap(init_result_.map, cur_frame, true);
+        tracker_->trackFrameByMap(init_result_.map, cur_frame, false);
     if (!fallback_pnp_result.success)
         return false;
 
@@ -2245,7 +2464,7 @@ void Frontend::drainLocalMappingResults()
         consumeLocalMappingResult(output);
 }
 
-bool Frontend::submitKeyframeWithCommitBarrier(
+bool Frontend::trySubmitKeyframe(
     const std::shared_ptr<Map>& map,
     const std::shared_ptr<Frame>& cur_frame,
     const PnPResult& tracking_seed,
@@ -2254,67 +2473,41 @@ bool Frontend::submitKeyframeWithCommitBarrier(
     if (local_mapper_ == nullptr || map == nullptr || cur_frame == nullptr)
         return false;
 
-    const auto barrier_start = std::chrono::steady_clock::now();
-    LocalMappingOutput completed_output;
-    while (!local_mapper_->acceptKeyframe())
-    {
-        if (local_mapper_->waitPopFinishedResult(completed_output))
-        {
-            consumeLocalMappingResult(completed_output);
-            continue;
-        }
-
-        if (local_mapper_->finishRequested())
-            return false;
-    }
-
-    std::shared_ptr<Frame> ref_keyframe;
-    bool keyframe_queued = false;
+    // LocalMapper owns a bounded FIFO. Use its newest scheduled keyframe as
+    // the next triangulation reference so queued inputs preserve source order.
+    std::shared_ptr<Frame> ref_keyframe =
+        local_mapper_->getLatestScheduledKeyframe(map);
     std::size_t keyframe_num_before_mapping = 0;
-    while (!keyframe_queued)
     {
-        while (!local_mapper_->acceptKeyframe())
-        {
-            if (local_mapper_->waitPopFinishedResult(completed_output))
-            {
-                consumeLocalMappingResult(completed_output);
-                continue;
-            }
-            if (local_mapper_->finishRequested())
-                return false;
-        }
-
         std::lock_guard<std::mutex> map_lock(map->getMutex());
         if (init_result_.map != map)
             return false;
 
-        ref_keyframe = map->getLastKeyframe();
+        if (ref_keyframe == nullptr || !ref_keyframe->isKeyframe())
+            ref_keyframe = map->getLastKeyframe();
         if (ref_keyframe == nullptr || !ref_keyframe->isKeyframe())
             return false;
 
         keyframe_num_before_mapping = map->getKeyframeNum();
         cur_frame->setKeyframe(true);
-        keyframe_queued = local_mapper_->insertKeyframe(
-            LocalMappingInput{map, ref_keyframe, cur_frame, tracking_seed});
-        if (!keyframe_queued)
+        if (!local_mapper_->insertKeyframe(
+            LocalMappingInput{map, ref_keyframe, cur_frame, tracking_seed}))
+        {
             cur_frame->setKeyframe(false);
+            keyframe_busy_rejected_num_++;
+            ROS_INFO_STREAM_THROTTLE(1.0,
+                "P2-KITTI-SCHED-R156 keyframe_rejected_queue_full frame="
+                << cur_frame->getId());
+            return false;
+        }
     }
 
-    keyframe_commit_barrier_num_++;
-    ROS_INFO_STREAM("Queued new keyframe: " << cur_frame->getId()
+    keyframe_queued_num_++;
+    ROS_INFO_STREAM("P2-KITTI-SCHED-R156 queued_keyframe frame=" << cur_frame->getId()
                     << ", ref keyframe: " << ref_keyframe->getId()
                     << ", tracking inliers: " << tracking_result.inlier_map_points.size()
                     << ", map keyframe num(before local mapping): "
                     << keyframe_num_before_mapping);
-
-    if (!local_mapper_->waitPopFinishedResult(completed_output))
-        return false;
-    consumeLocalMappingResult(completed_output);
-
-    const double barrier_wait_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - barrier_start).count();
-    ROS_INFO_STREAM("P2-KITTI-SCHED-R136 commit_barrier frame=" << cur_frame->getId()
-                    << " wait_ms=" << barrier_wait_ms);
     return true;
 }
 
@@ -2427,9 +2620,10 @@ void Frontend::acceptTrackingResult(const std::shared_ptr<Frame>& cur_frame,
     }
 
     if (keyframe_requested &&
-        !submitKeyframeWithCommitBarrier(map, cur_frame, pnp_result, tracking_result_))
+        !trySubmitKeyframe(map, cur_frame, pnp_result, tracking_result_))
     {
-        ROS_WARN_STREAM("Keyframe commit barrier did not submit frame " << cur_frame->getId());
+        ROS_INFO_STREAM_THROTTLE(1.0,
+            "P2-KITTI-SCHED-R156 keyframe_not_admitted frame=" << cur_frame->getId());
     }
     else if (!recovered_from_tmp_lost)
     {
@@ -2815,18 +3009,30 @@ void Frontend::processImage(const cv::Mat& image, double timestamp)
         bool relocal_success = false;
 
         const auto tracking_section_start = std::chrono::steady_clock::now();
-        double tracking_map_lock_wait_ms = 0.0;
+        double tracking_snapshot_lock_wait_ms = 0.0;
+        double tracking_snapshot_build_ms = 0.0;
+        std::size_t tracking_snapshot_num = 0;
+        std::unique_lock<std::mutex> full_tracking_lock;
+        if (tracking_full_map_lock_)
         {
-            const auto tracking_map_lock_start = std::chrono::steady_clock::now();
-            std::lock_guard<std::mutex> map_lock(init_result_.map->getMutex());
-            tracking_map_lock_wait_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - tracking_map_lock_start).count();
-            track_success = 
-                trackCurrentFrame(cur_frame, pnp_result, new_tracking_result, local_map_points);
-
-            tracking_accepted = 
-                track_success && isTrackingAccepted(pnp_result, new_tracking_result, required_inliers);
+            full_tracking_lock = std::unique_lock<std::mutex>(
+                init_result_.map->getMutex());
         }
+        track_success =
+            trackCurrentFrame(cur_frame,
+                              pnp_result,
+                              new_tracking_result,
+                              local_map_points,
+                              tracking_snapshot_lock_wait_ms,
+                              tracking_snapshot_build_ms,
+                              tracking_snapshot_num,
+                              tracking_full_map_lock_);
+
+        tracking_accepted =
+            track_success && isTrackingAccepted(pnp_result, new_tracking_result, required_inliers);
+
+        if (full_tracking_lock.owns_lock())
+            full_tracking_lock.unlock();
 
         // Relocalization obtains its own map snapshot through
         // collectRelocalizationCandidates()/Map::copyKeyframes().  Do not
@@ -2842,8 +3048,11 @@ void Frontend::processImage(const cv::Mat& image, double timestamp)
             std::chrono::steady_clock::now() - tracking_section_start).count();
         ROS_INFO_STREAM_THROTTLE(1.0,
             "P2-EUROC-PERF-R34 tracking_section_ms=" << tracking_section_ms
-            << " map_lock_wait_ms=" << tracking_map_lock_wait_ms
-            << " tracking_work_ms=" << (tracking_section_ms - tracking_map_lock_wait_ms));
+            << " map_lock_wait_ms=" << tracking_snapshot_lock_wait_ms
+            << " snapshot_build_ms=" << tracking_snapshot_build_ms
+            << " snapshot_count=" << tracking_snapshot_num
+            << " tracking_work_ms="
+            << (tracking_section_ms - tracking_snapshot_lock_wait_ms));
 
         if (!tracking_accepted)
         {

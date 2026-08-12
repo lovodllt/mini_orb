@@ -22,7 +22,8 @@ public:
             const std::shared_ptr<PoseOptimizer>& pose_optimizer,
             double scale_factor,
             int levels_num,
-            float base_projection_search_radius = 15.0f);
+            float base_projection_search_radius = 15.0f,
+            bool enable_tracking_diagnostics = false);
 
     PnPResult estimatePoseByPnP(const InitializationResult& init_result) const;
 
@@ -33,7 +34,8 @@ public:
     PnPResult trackFrameByProjectionOnly(const std::vector<std::shared_ptr<MapPoint>>& map_points,
                                          const std::shared_ptr<Frame>& cur_frame,
                                          float radius_scale = 1.0f,
-                                         bool update_statistics = true) const;
+                                         bool update_statistics = true,
+                                         const char* diag_stage = nullptr) const;
 
     PnPResult trackFrameByMotionModel(const std::shared_ptr<Frame>& last_frame,
                                       const std::shared_ptr<Frame>& cur_frame) const;
@@ -133,7 +135,8 @@ private:
         std::unordered_set<std::size_t>& used_map_point_ids,
         std::unordered_set<int>& used_feature_indices,
         PnPResult& result,
-        std::vector<std::shared_ptr<MapPoint>>* visible_map_points = nullptr) const;
+        std::vector<std::shared_ptr<MapPoint>>* visible_map_points = nullptr,
+        const char* diag_stage = nullptr) const;
 
     PnPResult trackFrameByProjection(
         const std::vector<std::shared_ptr<MapPoint>>& map_points,                             
@@ -142,7 +145,10 @@ private:
         bool update_statistics,
         bool apply_ratio_test,
         bool apply_view_gate,
-        std::vector<std::shared_ptr<MapPoint>>* visible_map_points = nullptr) const;
+        std::vector<std::shared_ptr<MapPoint>>* visible_map_points = nullptr,
+        const char* diag_stage = nullptr) const;
+
+    bool shouldEmitTrackingDiag(const std::shared_ptr<Frame>& frame) const;
 
     std::shared_ptr<Camera> camera_;
     const Matcher& matcher_;
@@ -151,6 +157,7 @@ private:
     double scale_factor_{1.2};
     int levels_num_{8};
     float base_projection_search_radius_{15.0f};
+    bool enable_tracking_diagnostics_{false};
 };
 
 } // namespace mini_orb_slam

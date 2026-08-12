@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -11,6 +12,8 @@ namespace mini_orb_slam
 
 namespace
 {
+
+constexpr std::size_t kTrackingDiagFrameLimit = 30;
 
 double pointNorm(const cv::Point3d& p)
 {
@@ -60,13 +63,22 @@ Tracker::Tracker(const std::shared_ptr<Camera>& camera,
                 const std::shared_ptr<PoseOptimizer>& pose_optimizer,
                 double scale_factor,
                 int levels_num,
-                float base_projection_search_radius) 
+                float base_projection_search_radius,
+                bool enable_tracking_diagnostics) 
     : camera_(camera), 
       matcher_(matcher), 
       pose_optimizer_(pose_optimizer),
       scale_factor_(scale_factor > 1.0 ? scale_factor : 1.2),
       levels_num_(levels_num > 0 ? levels_num : 8),
-      base_projection_search_radius_(base_projection_search_radius > 0.0f ? base_projection_search_radius : 15.0f) {}
+      base_projection_search_radius_(base_projection_search_radius > 0.0f ? base_projection_search_radius : 15.0f),
+      enable_tracking_diagnostics_(enable_tracking_diagnostics) {}
+
+bool Tracker::shouldEmitTrackingDiag(const std::shared_ptr<Frame>& frame) const
+{
+    return enable_tracking_diagnostics_ &&
+           frame != nullptr &&
+           frame->getId() <= kTrackingDiagFrameLimit;
+}
 
 PnPResult Tracker::estimatePoseByPnP(const InitializationResult& init_result) const
 {
@@ -509,7 +521,7 @@ PnPResult Tracker::trackFrameByMapPoints(const std::vector<std::shared_ptr<MapPo
     std::vector<std::shared_ptr<MapPoint>> visible_map_points;
     PnPResult best_result = 
         trackFrameByProjection(map_points, cur_frame, 1.0f, false, true, true,
-                                &visible_map_points);
+                                &visible_map_points, "motion_map_first");
 
     constexpr std::size_t kExpandProjectionMatches = 40;
     if (best_result.object_points.size() < kExpandProjectionMatches)
@@ -521,7 +533,8 @@ PnPResult Tracker::trackFrameByMapPoints(const std::vector<std::shared_ptr<MapPo
                                                            false, 
                                                            true,
                                                            true,
-                                                           &expanded_visible_map_points);
+                                                           &expanded_visible_map_points,
+                                                           "motion_map_expand");
 
         if (expanded_result.success ||
             expanded_result.object_points.size() > best_result.object_points.size())
@@ -599,13 +612,15 @@ PnPResult Tracker::trackFrameByMotionModel(const std::shared_ptr<Frame>& last_fr
         return {};
 
     PnPResult projection_result = 
-        trackFrameByProjection(last_frame_map_points, cur_frame, 1.0f, false, false, true);
+        trackFrameByProjection(last_frame_map_points, cur_frame, 1.0f, false, false, true,
+                               nullptr, "motion_seed_first");
 
     if (projection_result.object_points.size() >= kMinProjectionMatches)
         return projection_result;
 
     PnPResult expanded_projection_result = 
-        trackFrameByProjection(last_frame_map_points, cur_frame, 2.0f, false, false, true);
+        trackFrameByProjection(last_frame_map_points, cur_frame, 2.0f, false, false, true,
+                               nullptr, "motion_seed_expand");
 
     if (expanded_projection_result.object_points.size() < kMinProjectionMatches)
         return {};
@@ -827,7 +842,8 @@ void Tracker::appendProjectionCorrespondences(
     std::unordered_set<std::size_t>& used_map_point_ids,
     std::unordered_set<int>& used_feature_indices,
     PnPResult& result,
-    std::vector<std::shared_ptr<MapPoint>>* visible_map_points) const
+    std::vector<std::shared_ptr<MapPoint>>* visible_map_points,
+    const char* diag_stage) const
 {
     if (cur_frame == nullptr || !cur_frame->hasFeatures())
         return;
@@ -988,25 +1004,30 @@ void Tracker::appendProjectionCorrespondences(
         matched_num++;
     }
 
-    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R19 frame=" << cur_frame->getId()
-                    << " timestamp_ns=" << static_cast<long long>(
-                           std::llround(cur_frame->getTimestamp() * 1e9))
-                    << " stage=projection radius=" << radius_scale
-                    << " ratio_test=" << (apply_ratio_test ? 1 : 0)
-                    << " input=" << map_points.size()
-                    << " skipped=" << skipped_map_points
-                    << " descriptor_missing=" << descriptor_missing
-                    << " projection_rejected=" << projection_rejected
-                    << " distance_low=" << distance_low_rejected
-                    << " distance_high=" << distance_high_rejected
-                    << " view_angle=" << view_angle_rejected
-                    << " border=" << border_rejected
-                    << " feature_missing=" << feature_missing
-                    << " no_spatial_candidate=" << no_spatial_candidate
-                    << " no_available_descriptor=" << no_available_descriptor
-                    << " hamming_rejected=" << hamming_rejected
-                    << " ratio_rejected=" << ratio_rejected
-                    << " matched=" << matched_num);
+    if (shouldEmitTrackingDiag(cur_frame))
+    {
+        ROS_INFO_STREAM("P2-KITTI-DIAG-R174 frame=" << cur_frame->getId()
+                        << " timestamp_ns=" << static_cast<long long>(
+                               std::llround(cur_frame->getTimestamp() * 1e9))
+                        << " stage=" << (diag_stage != nullptr ? diag_stage : "projection")
+                        << " radius=" << radius_scale
+                        << " ratio_test=" << (apply_ratio_test ? 1 : 0)
+                        << " view_gate=" << (apply_view_gate ? 1 : 0)
+                        << " input=" << map_points.size()
+                        << " skipped=" << skipped_map_points
+                        << " descriptor_missing=" << descriptor_missing
+                        << " projection_rejected=" << projection_rejected
+                        << " distance_low=" << distance_low_rejected
+                        << " distance_high=" << distance_high_rejected
+                        << " view_angle=" << view_angle_rejected
+                        << " border=" << border_rejected
+                        << " feature_missing=" << feature_missing
+                        << " no_spatial_candidate=" << no_spatial_candidate
+                        << " no_available_descriptor=" << no_available_descriptor
+                        << " hamming_rejected=" << hamming_rejected
+                        << " ratio_rejected=" << ratio_rejected
+                        << " matched=" << matched_num);
+    }
 
 }
 
@@ -1022,6 +1043,7 @@ PnPResult Tracker::refinePoseWithLocalMap(
     }
 
     PnPResult combined_result;
+    const auto refine_start = std::chrono::steady_clock::now();
     const std::size_t reserve_num = 
         motion_pnp_result.inlier_indices.rows + local_map_points.size();
 
@@ -1040,7 +1062,10 @@ PnPResult Tracker::refinePoseWithLocalMap(
                                 combined_result, 
                                 used_map_point_ids, 
                                 used_feature_indices);     
+    const double seed_correspondence_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - refine_start).count();
 
+    const auto first_projection_start = std::chrono::steady_clock::now();
     appendProjectionCorrespondences(local_map_points, 
                                     cur_frame, 
                                     1.0f, 
@@ -1050,8 +1075,11 @@ PnPResult Tracker::refinePoseWithLocalMap(
                                     used_map_point_ids, 
                                     used_feature_indices, 
                                     combined_result);
+    const double first_projection_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - first_projection_start).count();
 
     const std::size_t first_pass_correspondences = combined_result.object_points.size();
+    double expanded_projection_ms = 0.0;
 
     // A slightly stale motion prediction can leave otherwise valid map points
     // just outside the nominal search window. Enlarge the geometric search
@@ -1060,6 +1088,7 @@ PnPResult Tracker::refinePoseWithLocalMap(
     constexpr std::size_t kSparseLocalMapCorrespondences = 50;
     if (combined_result.object_points.size() < kSparseLocalMapCorrespondences)
     {
+        const auto expanded_projection_start = std::chrono::steady_clock::now();
         appendProjectionCorrespondences(local_map_points,
                                         cur_frame,
                                         2.0f,
@@ -1069,6 +1098,8 @@ PnPResult Tracker::refinePoseWithLocalMap(
                                         used_map_point_ids,
                                         used_feature_indices,
                                         combined_result);
+        expanded_projection_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - expanded_projection_start).count();
     }
 
     if (combined_result.object_points.size() < 6 ||
@@ -1077,17 +1108,47 @@ PnPResult Tracker::refinePoseWithLocalMap(
         return {};
     }
 
-    return pose_optimizer_->optimizeWithPosePrior(combined_result);
+    const auto pose_optimize_start = std::chrono::steady_clock::now();
+    PnPResult optimized_result = pose_optimizer_->optimizeWithPosePrior(combined_result);
+    const double pose_optimize_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - pose_optimize_start).count();
+    const double total_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - refine_start).count();
+    ROS_INFO_STREAM_THROTTLE(1.0,
+        "P2-KITTI-PERF-R163 local_refine_phases frame=" << cur_frame->getId()
+        << " seed_correspondence_ms=" << seed_correspondence_ms
+        << " first_projection_ms=" << first_projection_ms
+        << " expanded_projection_ms=" << expanded_projection_ms
+        << " pose_optimize_ms=" << pose_optimize_ms
+        << " total_ms=" << total_ms
+        << " first_pass_correspondences=" << first_pass_correspondences
+        << " final_correspondences=" << combined_result.object_points.size()
+        << " local_map_points=" << local_map_points.size()
+        << " success=" << (optimized_result.success ? 1 : 0));
+    if (shouldEmitTrackingDiag(cur_frame))
+    {
+        ROS_INFO_STREAM("P2-KITTI-DIAG-R174 frame=" << cur_frame->getId()
+                        << " stage=local_refine_summary"
+                        << " seed_inliers=" << motion_pnp_result.inlier_num
+                        << " first_pass_correspondences=" << first_pass_correspondences
+                        << " final_correspondences=" << combined_result.object_points.size()
+                        << " optimized_success=" << (optimized_result.success ? 1 : 0)
+                        << " optimized_inliers=" << optimized_result.inlier_num
+                        << " optimized_reproj=" << optimized_result.optimized_reproj_error
+                        << " local_map_points=" << local_map_points.size());
+    }
+    return optimized_result;
 }
 
 PnPResult Tracker::trackFrameByProjectionOnly(const std::vector<std::shared_ptr<MapPoint>>& map_points,
                                               const std::shared_ptr<Frame>& cur_frame,
                                               float radius_scale,
-                                              bool update_statistics) const
+                                              bool update_statistics,
+                                              const char* diag_stage) const
 {
     const float valid_radius_scale = radius_scale > 0.0f ? radius_scale : 1.0f;
     return trackFrameByProjection(map_points, cur_frame, valid_radius_scale,
-                                  update_statistics, false, true);
+                                  update_statistics, false, true, nullptr, diag_stage);
 }
 
 PnPResult Tracker::trackFrameByProjection(
@@ -1097,7 +1158,8 @@ PnPResult Tracker::trackFrameByProjection(
     bool update_statistics,
     bool apply_ratio_test,
     bool apply_view_gate,
-    std::vector<std::shared_ptr<MapPoint>>* visible_map_points) const
+    std::vector<std::shared_ptr<MapPoint>>* visible_map_points,
+    const char* diag_stage) const
 {
     PnPResult result;
 
@@ -1124,7 +1186,8 @@ PnPResult Tracker::trackFrameByProjection(
                                     used_map_point_ids, 
                                     used_feature_indices, 
                                     result, 
-                                    visible_map_points);
+                                    visible_map_points,
+                                    diag_stage);
 
     if (result.object_points.size() < 6 || pose_optimizer_ == nullptr)
         return {};

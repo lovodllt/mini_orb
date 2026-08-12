@@ -51,6 +51,13 @@ public:
     void processImage(const cv::Mat& image, double timestamp);
 
 private:
+    struct TrackingLocalContext
+    {
+        std::vector<std::shared_ptr<Frame>> local_keyframes;
+        std::vector<std::shared_ptr<MapPoint>> local_map_points;
+        std::size_t map_version{0};
+    };
+
     bool initImpl(bool enable_ros_transport);
     bool openTrajectoryOutputFile(bool truncate);
 
@@ -113,6 +120,10 @@ private:
         const std::shared_ptr<Map>& map, 
         const TrackingResult& tracking_result) const;
 
+    TrackingLocalContext buildTrackingLocalContext(
+        const std::shared_ptr<Map>& map,
+        const TrackingResult& tracking_result) const;
+
     bool predictCurrentPoseByMotionModel(const std::shared_ptr<Frame>& cur_frame);
     void updateMotionModel(const std::shared_ptr<Frame>& prev_tracked_frame,
                            const std::shared_ptr<Frame>& cur_frame);
@@ -122,23 +133,29 @@ private:
     void consumeLocalMappingResult(const LocalMappingOutput& output);
     void drainLocalMappingResults();
     void drainLoopClosingResults();
-    bool submitKeyframeWithCommitBarrier(const std::shared_ptr<Map>& map,
-                                         const std::shared_ptr<Frame>& cur_frame,
-                                         const PnPResult& tracking_seed,
-                                         const TrackingResult& tracking_result);
+    bool trySubmitKeyframe(const std::shared_ptr<Map>& map,
+                           const std::shared_ptr<Frame>& cur_frame,
+                           const PnPResult& tracking_seed,
+                           const TrackingResult& tracking_result);
     
     void resetMotionModel();
 
     bool trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
                            PnPResult& pnp_result,
                            TrackingResult& tracking_result,
-                           std::vector<std::shared_ptr<MapPoint>>& local_map_points);
+                           std::vector<std::shared_ptr<MapPoint>>& local_map_points,
+                           double& snapshot_lock_wait_ms,
+                           double& snapshot_build_ms,
+                           std::size_t& snapshot_count,
+                           bool map_lock_held);
 
     bool refineTrackingSeed(const PnPResult& seed_pnp_result,
                             int min_seed_inliers,
                             int min_local_map_inliers,
                             const cv::Mat& predicted_R,
                             const cv::Mat& predicted_t,
+                            const TrackingLocalContext* local_context,
+                            bool map_lock_held,
                             const std::shared_ptr<Frame>& cur_frame,
                             PnPResult& pnp_result,
                             TrackingResult& tracking_result,
@@ -250,7 +267,7 @@ private:
     int max_keyframe_gap_{10};
     std::size_t keyframe_decision_num_{0};
     std::size_t keyframe_busy_rejected_num_{0};
-    std::size_t keyframe_commit_barrier_num_{0};
+    std::size_t keyframe_queued_num_{0};
     std::size_t keyframe_force_insert_num_{0};
     std::size_t keyframe_weak_insert_num_{0};
     int tmp_lost_max_frames_{5};
@@ -284,6 +301,10 @@ private:
 
     std::string vocabulary_path_;
     int max_relocalization_candidates_{5};
+    bool tracking_full_map_lock_{false};
+    bool tracking_diagnostic_logging_{false};
+    bool tracking_legacy_live_map_{false};
+    int deterministic_ransac_seed_{-1};
 };
 
 } // namespace mini_orb_slam
