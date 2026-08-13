@@ -31,8 +31,6 @@ public:
 
     PnPResult optimize(const PnPResult& input_result) const;
 
-    // ORB-SLAM2 logic reference: TrackLocalMap refines the pose supplied by
-    // the seed tracker directly against all local-map observations.
     PnPResult optimizeWithPosePrior(const PnPResult& input_result) const;
 
     InitialMapOptimizationResult optimizeInitialMap(
@@ -144,8 +142,6 @@ private:
         const std::vector<LocalBAObservation>& observations,
         const std::shared_ptr<MapPoint>& map_point) const;
 
-    // Caller holds Map::getMutex(). All geometry used by the solver is copied
-    // here, so g2o never reads mutable map state after the lock is released.
     LocalBAContext buildLocalBAContext(const std::shared_ptr<Map>& map,
                                        const std::shared_ptr<Frame>& cur_frame) const;
 

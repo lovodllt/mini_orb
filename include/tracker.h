@@ -61,8 +61,6 @@ public:
                                        const PnPResult& pnp_result) const;
 
 private:
-    // P2-EUROC-DEBUG-R19: records why a projected point did not yield a
-    // feature match. It is diagnostics-only and never participates in matching.
     struct ProjectionFeatureSearchResult
     {
         int feature_idx{-1};

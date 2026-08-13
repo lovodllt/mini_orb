@@ -34,9 +34,6 @@ public:
 
     std::vector<std::shared_ptr<Feature>> getKeyframeObservations(
         const std::shared_ptr<Frame>& exclude_frame = nullptr) const;
-    // Returns the same validated, de-duplicated keyframe observations as
-    // getKeyframeObservations(), but exposes the owning Frames directly. This
-    // avoids a second Feature -> Frame lookup in covisibility construction.
     std::vector<std::shared_ptr<Frame>> getKeyframeObservationFrames(
         const std::shared_ptr<Frame>& exclude_frame = nullptr) const;
     std::size_t getKeyframeObservationCount(
@@ -97,9 +94,6 @@ private:
 
     std::vector<std::weak_ptr<Feature>> observations_;
 
-    // Covisibility refreshes can query the same MapPoint several times in one
-    // mapper transaction. Invalidate this cache whenever the observation set
-    // changes; the generation check also prevents publishing a stale rebuild.
     mutable std::vector<std::weak_ptr<Frame>> keyframe_observation_frame_cache_;
     mutable std::size_t observation_generation_{0};
     mutable std::size_t keyframe_cache_generation_{

@@ -30,7 +30,7 @@ public:
         const double elapsed_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - start_).count();
         ROS_INFO_STREAM_THROTTLE(1.0,
-            "P2-EUROC-PERF-R23 image_callback_ms=" << elapsed_ms);
+            "P2-SLAM-PERF image_callback_ms=" << elapsed_ms);
     }
 
 private:
@@ -43,8 +43,6 @@ Frontend::Frontend(ros::NodeHandle& nh) : nh_(nh) {}
 
 Frontend::~Frontend()
 {
-    // LocalMapping can enqueue into LoopCloser. Join it first while the
-    // LoopCloser object is still alive, then stop the loop worker.
     if (local_mapper_ != nullptr)
     {
         local_mapper_->requestFinish();
@@ -120,18 +118,23 @@ bool Frontend::initImpl(bool enable_ros_transport)
     nh_.param("tracking_legacy_live_map",
               tracking_legacy_live_map_,
               tracking_legacy_live_map_);
+    nh_.param("tracking_wait_for_local_mapping_idle",
+              tracking_wait_for_local_mapping_idle_,
+              tracking_wait_for_local_mapping_idle_);
     nh_.param("deterministic_ransac_seed",
               deterministic_ransac_seed_,
               deterministic_ransac_seed_);
     if (deterministic_ransac_seed_ >= 0)
     {
         cv::setRNGSeed(deterministic_ransac_seed_);
-        ROS_INFO_STREAM("P2-KITTI-DIAG-R176 deterministic_ransac_seed="
+        ROS_INFO_STREAM("P2-SLAM-DIAG deterministic_ransac_seed="
                         << deterministic_ransac_seed_);
     }
-    ROS_INFO_STREAM("P2-KITTI-DIAG-R173 tracking_lock_mode full="
+    ROS_INFO_STREAM("P2-SLAM-DIAG tracking_lock_mode full="
                     << (tracking_full_map_lock_ ? 1 : 0)
-                    << " legacy_live_map=" << (tracking_legacy_live_map_ ? 1 : 0));
+                    << " legacy_live_map=" << (tracking_legacy_live_map_ ? 1 : 0)
+                    << " wait_for_mapper_idle="
+                    << (tracking_wait_for_local_mapping_idle_ ? 1 : 0));
 
     min_relocalization_inliers_ = std::max(min_recovery_inliers_, min_relocalization_inliers_);
 
@@ -247,8 +250,6 @@ bool Frontend::initImpl(bool enable_ros_transport)
     if (enable_ros_transport)
     {
         pose_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("/pose", 1);
-        // Replay acknowledgement is a transport stream, not a latched status:
-        // retain every count while the publisher is flow-controlled.
         processed_image_pub_ = nh_.advertise<std_msgs::UInt64>(processed_image_topic_, 600);
         image_sub_ = nh_.subscribe(camera_topic_, image_queue_size_, &Frontend::imageCallback, this);
     }
@@ -319,7 +320,7 @@ std::shared_ptr<Frame> Frontend::buildFrame(std::size_t id, double timestamp, co
     const double build_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - build_start).count();
     ROS_INFO_STREAM_THROTTLE(1.0,
-        "P2-EUROC-PERF-R25 frame_build orb_ms=" << orb_ms
+        "P2-SLAM-PERF frame_build orb_ms=" << orb_ms
         << " feature_wrap_ms=" << feature_wrap_ms
         << " total_ms=" << build_ms
         << " features=" << keypoints.size()
@@ -973,10 +974,6 @@ void Frontend::updateTrackObservations(const TrackingResult& tracking_result)
         if (map_point == nullptr || feature == nullptr)
             continue;
 
-        // ORB-SLAM2 logic reference: a MapPoint's persistent observations are
-        // KeyFrame-owned.  A normal tracking frame keeps only its local
-        // Feature -> MapPoint association; LocalMapper commits the reverse
-        // observation when that frame becomes a keyframe.
         feature->setMapPoint(map_point);
     }
 }
@@ -1089,7 +1086,7 @@ bool Frontend::shouldInsertKeyframe(const std::shared_ptr<Map>& map,
             keyframe_weak_insert_num_++;
     }
     ROS_INFO_STREAM(
-        "P2-KITTI-DIAG-R131 keyframe_admission frame=" << cur_frame->getId()
+        "P2-SLAM-DIAG keyframe_admission frame=" << cur_frame->getId()
         << " reference=" << reference_keyframe->getId()
         << " map_kf=" << keyframe_num
         << " gap=" << frame_gap
@@ -1100,7 +1097,7 @@ bool Frontend::shouldInsertKeyframe(const std::shared_ptr<Map>& map,
         << " force=" << (force_insert ? 1 : 0)
         << " insert=" << (insert ? 1 : 0));
     ROS_INFO_STREAM_THROTTLE(1.0,
-        "P2-EUROC-PERF-R29 keyframe_decision total=" << keyframe_decision_num_
+        "P2-SLAM-PERF keyframe_decision total=" << keyframe_decision_num_
         << " busy_rejected=" << keyframe_busy_rejected_num_
         << " queued=" << keyframe_queued_num_
         << " force_insert=" << keyframe_force_insert_num_
@@ -1183,11 +1180,6 @@ std::vector<std::shared_ptr<Frame>> Frontend::collectLocalKeyframes(
                 return a.keyframe->getId() > b.keyframe->getId();
               });
 
-    // ORB-SLAM2 logic reference: every keyframe observing a current-frame
-    // inlier MapPoint becomes a local seed. Each seed then contributes at
-    // most one covisible neighbor. This keeps the local map tied to actual
-    // observations rather than to recency alone. The 80-frame limit is only
-    // a computational safety bound; it is not a scene-specific threshold.
     constexpr std::size_t kMaxLocalKeyframes = 80;
 
     std::unordered_set<std::size_t> selected_ids;
@@ -1242,7 +1234,7 @@ std::vector<std::shared_ptr<Frame>> Frontend::collectLocalKeyframes(
 
     const std::size_t selected_after_neighbors = local_keyframes.size();
 
-    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R12 frame="
+    ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame="
                     << (tracking_result.frame != nullptr ? tracking_result.frame->getId() : 0)
                     << " stage=local_keyframes ranked=" << ranked_keyframe_num
                     << " seed=" << seed_keyframes.size()
@@ -1265,8 +1257,6 @@ std::vector<std::shared_ptr<Frame>> Frontend::collectRelocalizationCandidates(
 
     const std::vector<std::shared_ptr<Frame>> map_keyframes = map->copyKeyframes();
 
-    // ORB-SLAM2 logic reference: normal motion-model tracking does not build
-    // BoW. Relocalization is one of the explicit paths that needs it.
     if (keyframe_database_ != nullptr && bow_vocabulary_ != nullptr &&
         !cur_frame->hasBoW())
     {
@@ -1435,8 +1425,6 @@ std::vector<std::shared_ptr<Frame>> Frontend::collectRelocalizationCandidates(
 
             if (!candidates.empty())
             {
-                // BoW can return a recent keyframe with very few map
-                // observations while omitting the dense initial anchor.
                 ensureInitialAnchor();
                 return candidates;
             }
@@ -1685,7 +1673,7 @@ std::vector<std::shared_ptr<MapPoint>> Frontend::collectLocalMapPoints(
             observation_count_two_or_more++;
     }
 
-    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R12 frame="
+    ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame="
                     << (tracking_result.frame != nullptr ? tracking_result.frame->getId() : 0)
                     << " stage=local_map_points seed=" << seed_map_point_num
                     << " final=" << local_map_points.size()
@@ -1848,7 +1836,7 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
 
     if (!seed_pnp_result.success || seed_pnp_result.inlier_num < min_seed_inliers)
     {
-        ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R18 frame=" << cur_frame->getId()
+        ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame=" << cur_frame->getId()
                         << " stage=seed_reject success=" << seed_pnp_result.success
                         << " candidates=" << seed_pnp_result.object_points.size()
                         << " inliers=" << seed_pnp_result.inlier_num
@@ -1863,7 +1851,7 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
     if (!seed_tracking_result.success ||
         seed_tracking_result.inlier_map_points.size() < min_seed_inliers)
     {
-        ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R18 frame=" << cur_frame->getId()
+        ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame=" << cur_frame->getId()
                         << " stage=seed_tracking_reject candidates="
                         << seed_pnp_result.object_points.size()
                         << " pnp_inliers=" << seed_pnp_result.inlier_num
@@ -1883,9 +1871,6 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
     }
     else
     {
-        // A failed snapshot must not reopen an unlocked live-map path. This
-        // fallback is uncommon, but its local-map traversal still needs a
-        // coherent container/observation view.
         if (map_lock_held)
         {
             candidate_local_map_points = collectLocalMapPoints(init_result_.map,
@@ -1903,7 +1888,7 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
 
     if (candidate_local_map_points.size() < 20)
     {
-        ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R18 frame=" << cur_frame->getId()
+        ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame=" << cur_frame->getId()
                         << " stage=local_map_reject seed_tracking_inliers="
                         << seed_tracking_result.inlier_map_points.size()
                         << " local_map_points=" << candidate_local_map_points.size());
@@ -1911,7 +1896,7 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
         return false;
     }
 
-    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R18 frame=" << cur_frame->getId()
+    ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame=" << cur_frame->getId()
                     << " stage=local_map_ready seed_candidates="
                     << seed_pnp_result.object_points.size()
                     << " seed_inliers=" << seed_pnp_result.inlier_num
@@ -1927,7 +1912,7 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
 
     if (!refined_pnp_result.success)
     {
-        ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R18 frame=" << cur_frame->getId()
+        ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame=" << cur_frame->getId()
                         << " stage=refined_pnp_reject local_map_points="
                         << candidate_local_map_points.size());
         restorePredictedPose();
@@ -1948,7 +1933,7 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
                                              refined_tracking_result, 
                                              min_local_map_inliers);   
 
-    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R18 frame=" << cur_frame->getId()
+    ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame=" << cur_frame->getId()
                     << " stage=refined_result candidates="
                     << refined_pnp_result.object_points.size()
                     << " pnp_inliers=" << refined_pnp_result.inlier_num
@@ -1962,7 +1947,7 @@ bool Frontend::refineTrackingSeed(const PnPResult& seed_pnp_result,
         restorePredictedPose();
 
     ROS_INFO_STREAM_THROTTLE(1.0,
-        "P2-KITTI-PERF-R163 tracking_refine_phases frame=" << cur_frame->getId()
+        "P2-SLAM-PERF tracking_refine_phases frame=" << cur_frame->getId()
         << " local_map_collect_ms=" << local_map_collect_ms
         << " local_refine_ms=" << local_refine_ms
         << " refined_association_ms=" << refined_association_ms
@@ -2002,7 +1987,7 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
         if (cur_frame->getId() > 30)
             return;
 
-        ROS_INFO_STREAM("P2-KITTI-DIAG-R174 frame=" << cur_frame->getId()
+        ROS_INFO_STREAM("P2-SLAM-DIAG frame=" << cur_frame->getId()
                         << " stage=" << stage
                         << " map_version=" << init_result_.map->getVersion()
                         << " candidates=" << seed_result.object_points.size()
@@ -2018,14 +2003,14 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
         const double total_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - tracking_start).count();
         ROS_INFO_STREAM_THROTTLE(1.0,
-            "P2-EUROC-PERF-R33 tracking_path=" << path
+            "P2-SLAM-PERF tracking_path=" << path
             << " prediction_ms=" << prediction_ms
             << " seed_ms=" << seed_ms
             << " refine_ms=" << refine_ms
             << " total_ms=" << total_ms);
         if (cur_frame->getId() <= 30)
         {
-            ROS_INFO_STREAM("P2-KITTI-DIAG-R174 frame=" << cur_frame->getId()
+            ROS_INFO_STREAM("P2-SLAM-DIAG frame=" << cur_frame->getId()
                             << " stage=tracking_result"
                             << " path=" << path
                             << " map_version=" << init_result_.map->getVersion()
@@ -2051,9 +2036,6 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
     cv::Mat predicted_t;
     cur_frame->copyPose(predicted_R, predicted_t);
 
-    // Normal tracking and relocalization have separate acceptance contracts.
-    // A post-recovery guard prevents immediate keyframe churn, but must not
-    // raise the normal tracking inlier requirement to the relocalization one.
     const int required_local_inliers = min_tracking_inliers_;
     auto snapshotLocalContext = [&](const PnPResult& seed_result,
                                     TrackingLocalContext& local_context) -> bool
@@ -2092,14 +2074,14 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
         snapshot_build_ms += snapshot_build_duration_ms;
         snapshot_count++;
         ROS_INFO_STREAM_THROTTLE(1.0,
-            "P2-KITTI-PERF-R170 tracking_snapshot lock_wait_ms=" << lock_wait_ms
+            "P2-SLAM-PERF tracking_snapshot lock_wait_ms=" << lock_wait_ms
             << " build_ms=" << snapshot_build_duration_ms
             << " keyframes=" << local_context.local_keyframes.size()
             << " map_points=" << local_context.local_map_points.size()
             << " map_version=" << local_context.map_version);
         if (cur_frame->getId() <= 30)
         {
-            ROS_INFO_STREAM("P2-KITTI-DIAG-R174 frame=" << cur_frame->getId()
+            ROS_INFO_STREAM("P2-SLAM-DIAG frame=" << cur_frame->getId()
                             << " stage=local_context"
                             << " map_version=" << local_context.map_version
                             << " local_keyframes=" << local_context.local_keyframes.size()
@@ -2108,7 +2090,7 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
         }
         const double snapshot_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - snapshot_start).count();
-        ROS_DEBUG_STREAM("P2-KITTI-PERF-R170 tracking_snapshot_total frame="
+        ROS_DEBUG_STREAM("P2-SLAM-PERF tracking_snapshot_total frame="
                          << cur_frame->getId() << " total_ms=" << snapshot_ms);
         return !local_context.local_map_points.empty();
     };
@@ -2119,7 +2101,7 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
     const double motion_seed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - motion_seed_start).count();
 
-    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R18 frame=" << cur_frame->getId()
+    ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame=" << cur_frame->getId()
                     << " stage=motion_seed candidates="
                     << motion_pnp_result.object_points.size()
                     << " inliers=" << motion_pnp_result.inlier_num
@@ -2157,7 +2139,7 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
         tracker_->trackFrameByReferenceFrame(last_tracked_frame_, cur_frame);
     const double reference_frame_seed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - reference_frame_seed_start).count();
-    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R18 frame=" << cur_frame->getId()
+    ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame=" << cur_frame->getId()
                     << " stage=reference_frame_seed candidates="
                     << reference_frame_pnp_result.object_points.size()
                     << " inliers=" << reference_frame_pnp_result.inlier_num
@@ -2208,7 +2190,7 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
         tracker_->trackFrameByBoWKeyframe(reference_keyframe, cur_frame);
     const double bow_seed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - bow_seed_start).count();
-    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R18 frame=" << cur_frame->getId()
+    ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame=" << cur_frame->getId()
                     << " stage=bow_seed ref_keyframe=" << reference_keyframe->getId()
                     << " candidates=" << reference_pnp_result.object_points.size()
                     << " inliers=" << reference_pnp_result.inlier_num
@@ -2236,15 +2218,12 @@ bool Frontend::trackCurrentFrame(const std::shared_ptr<Frame>& cur_frame,
         return true;
     }
 
-    // The reference-keyframe path can fail when descriptors are temporarily
-    // weak. A descriptor PnP over the active map is the final tracking-stage
-    // fallback; relocalization remains the separate recovery path.
     const auto map_seed_start = std::chrono::steady_clock::now();
     const PnPResult map_pnp_result =
         tracker_->trackFrameByMap(init_result_.map, cur_frame, map_lock_held);
     const double map_seed_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - map_seed_start).count();
-    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R18 frame=" << cur_frame->getId()
+    ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame=" << cur_frame->getId()
                     << " stage=map_seed candidates=" << map_pnp_result.object_points.size()
                     << " inliers=" << map_pnp_result.inlier_num
                     << " success=" << (map_pnp_result.success ? 1 : 0));
@@ -2400,10 +2379,6 @@ void Frontend::consumeLocalMappingResult(const LocalMappingOutput& output)
     if (init_result_.map == nullptr || map != init_result_.map)
         return;
 
-        // Keep the existing tracking reference when it still belongs to the
-        // active map. A newly inserted keyframe may contain only the weak
-        // inlier set that triggered insertion and is not yet a robust
-        // relocalization anchor.
     const std::shared_ptr<Frame> existing_reference =
         tracking_reference_keyframe_.lock();
     if (existing_reference == nullptr || !existing_reference->isKeyframe())
@@ -2447,9 +2422,6 @@ void Frontend::consumeLocalMappingResult(const LocalMappingOutput& output)
                         << ", loop keyframe queued: "
                         << (output.result.loop_keyframe_queued ? "true" : "false"));
 
-        // Current project adaptation: normal frames lack ORB-SLAM2's stored
-        // reference-keyframe-relative pose, so a committed Local BA can make
-        // the cached normal-frame velocity stale.
     if (output.result.local_ba_success)
         resetMotionModel();
 }
@@ -2473,8 +2445,6 @@ bool Frontend::trySubmitKeyframe(
     if (local_mapper_ == nullptr || map == nullptr || cur_frame == nullptr)
         return false;
 
-    // LocalMapper owns a bounded FIFO. Use its newest scheduled keyframe as
-    // the next triangulation reference so queued inputs preserve source order.
     std::shared_ptr<Frame> ref_keyframe =
         local_mapper_->getLatestScheduledKeyframe(map);
     std::size_t keyframe_num_before_mapping = 0;
@@ -2496,14 +2466,14 @@ bool Frontend::trySubmitKeyframe(
             cur_frame->setKeyframe(false);
             keyframe_busy_rejected_num_++;
             ROS_INFO_STREAM_THROTTLE(1.0,
-                "P2-KITTI-SCHED-R156 keyframe_rejected_queue_full frame="
+                "P2-SLAM-SCHED keyframe_rejected_queue_full frame="
                 << cur_frame->getId());
             return false;
         }
     }
 
     keyframe_queued_num_++;
-    ROS_INFO_STREAM("P2-KITTI-SCHED-R156 queued_keyframe frame=" << cur_frame->getId()
+    ROS_INFO_STREAM("P2-SLAM-SCHED queued_keyframe frame=" << cur_frame->getId()
                     << ", ref keyframe: " << ref_keyframe->getId()
                     << ", tracking inliers: " << tracking_result.inlier_map_points.size()
                     << ", map keyframe num(before local mapping): "
@@ -2595,12 +2565,9 @@ void Frontend::acceptTrackingResult(const std::shared_ptr<Frame>& cur_frame,
         const double map_lock_wait_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - map_lock_start).count();
         ROS_INFO_STREAM_THROTTLE(1.0,
-            "P2-EUROC-PERF-R21 frontend_tracking_map_lock_wait_ms="
+            "P2-SLAM-PERF frontend_tracking_map_lock_wait_ms="
             << map_lock_wait_ms);
 
-        // Current-project concurrency repair: Local BA may publish a keyframe
-        // pose on its worker thread. Capture both tracking poses while map
-        // publication is excluded so the velocity model cannot mix BA epochs.
         if (!recovered_from_tmp_lost)
             updateMotionModel(prev_tracked_frame, cur_frame);
 
@@ -2623,7 +2590,7 @@ void Frontend::acceptTrackingResult(const std::shared_ptr<Frame>& cur_frame,
         !trySubmitKeyframe(map, cur_frame, pnp_result, tracking_result_))
     {
         ROS_INFO_STREAM_THROTTLE(1.0,
-            "P2-KITTI-SCHED-R156 keyframe_not_admitted frame=" << cur_frame->getId());
+            "P2-SLAM-SCHED keyframe_not_admitted frame=" << cur_frame->getId());
     }
     else if (!recovered_from_tmp_lost)
     {
@@ -2943,6 +2910,21 @@ void Frontend::processImage(const cv::Mat& image, double timestamp)
     drainLocalMappingResults();
     drainLoopClosingResults();
 
+    if (tracking_wait_for_local_mapping_idle_ &&
+        status_ != FrontendStatus::INITING && local_mapper_ != nullptr)
+    {
+        const auto wait_start = std::chrono::steady_clock::now();
+        const bool mapper_idle = local_mapper_->waitUntilIdle();
+        const double wait_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - wait_start).count();
+        ROS_INFO_STREAM("P2-SLAM-DIAG mapper_idle_barrier frame="
+                        << cur_frame->getId()
+                        << " waited_ms=" << wait_ms
+                        << " idle=" << (mapper_idle ? 1 : 0));
+        drainLocalMappingResults();
+        drainLoopClosingResults();
+    }
+
     if (status_ == FrontendStatus::INITING)
     {
         if (last_frame_ == nullptr)
@@ -3034,10 +3016,6 @@ void Frontend::processImage(const cv::Mat& image, double timestamp)
         if (full_tracking_lock.owns_lock())
             full_tracking_lock.unlock();
 
-        // Relocalization obtains its own map snapshot through
-        // collectRelocalizationCandidates()/Map::copyKeyframes().  Do not
-        // call it while the tracking transaction owns Map::mutex_: the
-        // snapshot helper would otherwise self-deadlock on the same mutex.
         if (!tracking_accepted)
         {
             relocal_success =
@@ -3047,7 +3025,7 @@ void Frontend::processImage(const cv::Mat& image, double timestamp)
         const double tracking_section_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - tracking_section_start).count();
         ROS_INFO_STREAM_THROTTLE(1.0,
-            "P2-EUROC-PERF-R34 tracking_section_ms=" << tracking_section_ms
+            "P2-SLAM-PERF tracking_section_ms=" << tracking_section_ms
             << " map_lock_wait_ms=" << tracking_snapshot_lock_wait_ms
             << " snapshot_build_ms=" << tracking_snapshot_build_ms
             << " snapshot_count=" << tracking_snapshot_num
@@ -3110,9 +3088,6 @@ void Frontend::processImage(const cv::Mat& image, double timestamp)
         TrackingResult relocal_tracking_result;
         bool relocal_success = false;
 
-        // tryRelocalization() takes a consistent map snapshot internally;
-        // keep it outside the caller's map transaction to avoid recursive
-        // acquisition of Map::mutex_.
         relocal_success =
             tryRelocalization(cur_frame, relocal_pnp_result, relocal_tracking_result);
 
@@ -3206,8 +3181,6 @@ void Frontend::publishCurrentPose(const std::shared_ptr<Frame>& frame)
             << position.z << "\n";
     }
 
-    // A replay acknowledgement means this accepted pose is durable.  Without
-    // this flush, a forced shutdown can silently discard the buffered tail.
     trajectory_output_.flush();
     if (!trajectory_output_)
         ROS_ERROR("Failed to persist accepted trajectory pose.");

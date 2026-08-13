@@ -173,9 +173,6 @@ void Map::reconcileCovisibilityConstraints(
 
     bool removed_constraints = removeExpiredPoseGraphConstraints();
 
-    // The incident index already identifies every edge whose validity can
-    // change when one of these keyframes changes. Avoid evaluating unrelated
-    // sequential/covisibility/loop edges on every BA commit.
     std::unordered_set<std::size_t> affected_constraint_indices;
     affected_constraint_indices.reserve(affected_ids.size() * 16 + 1);
     for (const std::size_t keyframe_id : affected_ids)

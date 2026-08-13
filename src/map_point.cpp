@@ -152,8 +152,6 @@ void MapPoint::addObservation(const std::shared_ptr<Feature>& feature)
         if (obs == feature)
             return;
 
-        // ORB-SLAM2 logic reference: observations are keyed by KeyFrame, so a
-        // MapPoint can have at most one feature observation in a keyframe.
         const std::shared_ptr<Frame> obs_frame = obs->getFrame();
         const std::shared_ptr<Frame> feature_frame = feature->getFrame();
         if (obs_frame != nullptr && feature_frame != nullptr &&
@@ -315,9 +313,6 @@ std::vector<std::shared_ptr<Feature>> MapPoint::getObservations() const
         }
     }
 
-    // Validate reverse links after releasing observation_mutex_. This avoids
-    // the Feature -> MapPoint and MapPoint -> Feature lock-order inversion
-    // during concurrent fusion/BA maintenance.
     observations.erase(
         std::remove_if(observations.begin(), observations.end(),
                        [this](const std::shared_ptr<Feature>& feature)
@@ -405,9 +400,6 @@ std::vector<std::shared_ptr<Frame>> MapPoint::getKeyframeObservationFrames(
     std::unordered_set<std::size_t> observed_keyframe_ids;
     observed_keyframe_ids.reserve(observations.size());
 
-    // Keep the reverse-link validation and keyframe de-duplication identical
-    // to getKeyframeObservations(), while avoiding a second Frame lookup in
-    // Frame::updateConnections().
     for (const auto& feature : observations)
     {
         if (feature == nullptr || feature->getMapPoint().get() != this)

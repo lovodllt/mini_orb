@@ -586,8 +586,6 @@ bool PoseOptimizer::validateLocalBACandidate(const PnPResult& tracking_seed,
         return false;
     }
 
-    // Current-project reprojection must be evaluated against the candidate
-    // point estimates from the same BA transaction, not the pre-BA map.
     constexpr double kMaxSeedErrorIncreasePx = 0.25;
     constexpr double kMaxSeedErrorIncreaseRatio = 1.10;
 
@@ -638,8 +636,6 @@ PnPResult PoseOptimizer::optimizeImpl(const PnPResult& input_result,
 
     if (run_pnp_ransac)
     {
-        // OpenCV is used only to obtain a robust initial pose. The accepted
-        // pose and inlier set come from the four-round g2o refinement below.
         const int ransac_method = has_inital_pose ? cv::SOLVEPNP_ITERATIVE
                                                    : cv::SOLVEPNP_EPNP;
         bool success = false;
@@ -756,9 +752,6 @@ PnPResult PoseOptimizer::optimizeImpl(const PnPResult& input_result,
     if (edges.size() < 6)
         return {};
 
-    // ORB-SLAM2 logic reference: four 10-iteration rounds, classify edges
-    // by the 2-DoF chi-square gate, and remove the robust kernel for the last
-    // refinement rounds. Outlier decisions are local to this PnP result.
     for (int iteration = 0; iteration < 4; ++iteration)
     {
         if (!optimizer.initializeOptimization(0))
@@ -975,10 +968,6 @@ std::vector<PoseOptimizer::LocalBAObservation> PoseOptimizer::collectLocalBAObse
 
     std::unordered_map<std::size_t, int> observation_count_by_point;
 
-    // Keep the observation order identical to the previous candidate/filter
-    // path, but build the final vector only once.  Local BA is invoked for
-    // every admitted keyframe, so copying the complete edge set here becomes
-    // increasingly expensive as the map grows.
     observations.reserve(local_map_points.size() * 4);
     observation_count_by_point.reserve(local_map_points.size() * 2 + 1);
 
@@ -1021,9 +1010,6 @@ std::vector<PoseOptimizer::LocalBAObservation> PoseOptimizer::collectLocalBAObse
         }
     }
 
-    // ORB-SLAM2 only creates a point vertex when it has at least two valid
-    // observations in the local BA graph.  Remove under-constrained points
-    // in place, preserving the exact edge order for all retained points.
     observations.erase(
         std::remove_if(observations.begin(), observations.end(),
                        [&observation_count_by_point](const LocalBAObservation& observation)
@@ -2278,8 +2264,6 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
         return result;
     }
 
-    // The expensive solve used only the immutable context above. Re-enter the
-    // map transaction only to validate and publish a complete candidate.
     const auto commit_start = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> map_lock(map->getMutex());
     if (map->getVersion() != context.map_version || !cur_keyframe->isKeyframe())
@@ -2302,11 +2286,6 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
     std::unordered_set<std::size_t> touched_map_point_ids;
     touched_map_point_ids.reserve(context.local_map_points.size() * 2 + 1);
 
-    // A BA pose/position update does not change a MapPoint's descriptor.  The
-    // descriptor only needs recomputation when this transaction removes an
-    // observation.  ORB-SLAM2's Local BA follows the same separation: it
-    // refreshes geometric normal/depth state for optimized points, while
-    // distinctive descriptors are maintained when observations change.
     std::vector<std::shared_ptr<MapPoint>> touched_map_points;
     touched_map_points.reserve(graph_edges.size());
 
@@ -2370,9 +2349,6 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
         std::chrono::steady_clock::now() - view_statistics_start).count();
 
     const auto descriptor_refresh_start = std::chrono::steady_clock::now();
-    // Only MapPoints whose observations were actually detached can have a
-    // changed representative descriptor. Iterate that compact set directly
-    // instead of rescanning the entire local BA point set and hashing IDs.
     for (const auto& map_point : touched_map_points)
     {
         if (map_point == nullptr || map_point->isBad())
@@ -2386,9 +2362,6 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
     result.descriptor_refresh_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - descriptor_refresh_start).count();
 
-    // R110-A: rebuild exactly the topology touched by BA observation removal.
-    // Connections must be refreshed before selecting neighbors; otherwise the
-    // old R112 ordering can miss a newly affected covisibility endpoint.
     std::vector<std::shared_ptr<Frame>> topology_keyframes;
     std::unordered_set<std::size_t> topology_keyframe_ids;
     std::unordered_set<std::size_t> topology_connections_refreshed;
@@ -2427,9 +2400,6 @@ LocalBAResult PoseOptimizer::optimizeLocalMap(const std::shared_ptr<Map>& map,
 
     map->reconcileCovisibilityConstraints(topology_keyframes);
 
-    // R110-B: only Local BA-optimized poses can invalidate the relative
-    // measurement. Map indexes restrict this operation to their incident
-    // sequential/covisibility edges; Loop Closing retains full refreshes.
     map->refreshPoseGraphMeasurements(context.local_keyframes);
 
     map->markModified();
@@ -2583,10 +2553,6 @@ bool PoseOptimizer::optimizeEssentialGraph(const std::vector<std::shared_ptr<Fra
     if (optimizer.optimize(kMaxIterations) <= 0)
         return false;
 
-    // Build all corrected map-point positions in the optimizer candidate.  Do
-    // not mutate the live map until every pose and point has passed validation;
-    // otherwise a late invalid Sim3 vertex can leave a partial graph correction
-    // behind even though this function reports failure.
     struct OptimizedMapPoint
     {
         std::shared_ptr<MapPoint> map_point;
@@ -2675,19 +2641,12 @@ bool PoseOptimizer::optimizeEssentialGraph(const std::vector<std::shared_ptr<Fra
     if (optimized_poses.size() != states.size())
         return false;
 
-    // The caller holds the map transaction while invoking this function.  The
-    // final writes are deliberately grouped here so the official map observes
-    // either the complete essential-graph correction or no correction at all.
     for (const auto& optimized_pose : optimized_poses)
         optimized_pose.keyframe->setPose(optimized_pose.R_cw, optimized_pose.t_cw);
 
     for (const auto& optimized_point : optimized_map_points)
         optimized_point.map_point->setPos(optimized_point.position);
 
-    // Sequential/covisibility measurements depend on the corrected poses;
-    // refresh them after the complete commit while preserving the verified loop
-    // edge measurement.
-    // (The map version is advanced by the caller's surrounding transaction.)
 
     return true;
 }

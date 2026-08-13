@@ -27,8 +27,6 @@ public:
     Eigen::Vector3d Pixel2Camera(const Eigen::Vector2d& pixel, double depth) const;
     Eigen::Vector2d Camera2Pixel(const Eigen::Vector3d& pc) const;
 
-    // Scalar projection is the same pinhole calculation as Camera2Pixel(),
-    // exposed for Local Mapping's hot fusion loop.
     bool projectCameraPoint(double x, double y, double z,
                             double& u, double& v) const;
 

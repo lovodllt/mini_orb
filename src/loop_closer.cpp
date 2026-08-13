@@ -87,9 +87,6 @@ bool LoopCloser::insertKeyframe(const LoopClosingInput& input)
 
 bool LoopCloser::tryPopFinishedResult(LoopClosingOutput& output)
 {
-    // Keep the queue lock limited to ownership transfer. LoopClosingOutput
-    // may contain Sim3 correspondences and matrices; copying it while the
-    // frontend callback holds the queue lock delays the processed-image ACK.
     LoopClosingOutput ready_output;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -160,9 +157,6 @@ void LoopCloser::run()
             {
                 if (local_mapper_ != nullptr)
                 {
-                    // ORB-SLAM2 logic reference: local mapping is stopped
-                    // before loop correction so no stale Local BA can publish
-                    // over the corrected global state.
                     local_mapper_->requestStop();
                     while (!local_mapper_->isStopped() && !finish_requested_)
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -172,7 +166,7 @@ void LoopCloser::run()
                     std::lock_guard<std::mutex> map_lock(input.map->getMutex());
                     const std::size_t refreshed_constraints =
                         input.map->refreshPoseGraphMeasurements();
-                    ROS_INFO_STREAM("P2-KITTI-R79 graph_measurements_refreshed="
+                    ROS_INFO_STREAM("P2-SLAM-GRAPH graph_measurements_refreshed="
                                     << refreshed_constraints
                                     << " loop_keyframe=" << input.cur_keyframe->getId());
                     output.correction_result =
@@ -207,12 +201,6 @@ void LoopCloser::run()
                                                                         anchor_keyframe);
                             if (output.graph_optimized)
                             {
-                                // Essential-graph optimization changes the
-                                // keyframe poses but does not own Map's
-                                // version counter. Refresh geometry-derived
-                                // measurements and advance the transaction
-                                // generation only after the complete candidate
-                                // has been committed.
                                 input.map->refreshPoseGraphMeasurements();
                                 input.map->markModified();
                             }
@@ -250,9 +238,6 @@ std::unordered_set<std::size_t> LoopCloser::collectConnectedKeyframeIds(
     excluded_ids.reserve(16);
     excluded_ids.insert(keyframe->getId());
 
-    // ORB-SLAM2 logic reference: exclude the complete directly connected
-    // covisibility set, not only the strongest ten neighbors. This prevents
-    // near-duplicate keyframes from re-entering loop candidate verification.
     const std::vector<std::shared_ptr<Frame>> neighbors =
         keyframe->copyConnectedKeyframes(1);
 
@@ -530,11 +515,6 @@ std::vector<std::shared_ptr<Frame>> LoopCloser::detectLoopCandidates(
     for (const auto& item : grouped_candidates)
         ranked_groups.push_back(item.second);
 
-    // ORB-SLAM2 logic reference: a single BoW match is not a loop.  Keep
-    // covisibility groups across consecutive checks and only expose a group
-    // after it has been observed in three consecutive keyframes.  This also
-    // prevents near-by perceptual aliases from immediately changing the
-    // global pose graph.
     std::vector<ConsistentLoopGroup> current_consistent_groups;
     current_consistent_groups.reserve(ranked_groups.size());
     for (auto& group : ranked_groups)
@@ -946,9 +926,6 @@ bool LoopCloser::isLoopSim3Accepted(const LoopSim3Result& sim3_result,
     if (!sim3_result.success)
         return false;
 
-    // ORB-SLAM2 logic reference: OptimizeSim3 accepts a loop only after at
-    // least 20 optimized inlier correspondences.  The previous 12-point
-    // gate allowed a small perceptual alias to deform the entire map.
     if (sim3_result.inlier_num < 20)
         return false;
 

@@ -79,8 +79,6 @@ public:
 
     void recordCovisibilityConstraints(const std::shared_ptr<Frame>& keyframe);
 
-    // Reconcile a Local BA-updated covisibility neighborhood. Invalid edges
-    // are removed before current valid connections are recorded.
     void reconcileCovisibilityConstraints(
         const std::vector<std::shared_ptr<Frame>>& keyframes);
 
@@ -106,11 +104,6 @@ public:
         if (keyframe == nullptr)
             return;
 
-        // Retire the frame before rebuilding graph state. This prevents stale
-        // keyframe observations from surviving in MapPoint/Frame covisibility
-        // queries while external shared_ptr users still hold the Frame.
-        // Only keyframes incident to the removed observations can have their
-        // covisibility counts changed; keep that set for targeted refresh.
         std::unordered_map<std::size_t, std::shared_ptr<Frame>> affected_keyframes;
         const auto remember_affected =
             [&affected_keyframes, &keyframe](const std::shared_ptr<Frame>& candidate)
@@ -123,8 +116,6 @@ public:
         for (const auto& neighbor : keyframe->getConnectedKeyframes())
             remember_affected(neighbor);
 
-        // Include graph neighbors even if the Frame-side covisibility cache is
-        // stale. This retains the cleanup behavior of the old full refresh.
         for (const auto& constraint : pose_graph_constraints_)
         {
             const std::shared_ptr<Frame> from_keyframe = constraint.from_keyframe.lock();
@@ -204,8 +195,6 @@ public:
     std::size_t getMapPointNum() const { return map_points_.size(); }
     std::size_t getKeyframeNum() const { return keyframes_.size(); }
 
-    // The caller must hold getMutex(). This is a map-transaction generation,
-    // used to reject an optimization solved from a stale immutable snapshot.
     std::size_t getVersion() const
     {
         return version_.load(std::memory_order_acquire);
@@ -219,16 +208,12 @@ public:
     const std::vector<std::shared_ptr<MapPoint>>& getMapPoints() const { return map_points_; }
     const std::vector<std::shared_ptr<Frame>>& getKeyframes() const { return keyframes_; }
 
-    // Snapshot readers may be used outside a map transaction. They retain the
-    // pointed-to objects while LocalMapping changes the owning containers.
     std::vector<std::shared_ptr<MapPoint>> copyMapPoints() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return map_points_;
     }
 
-    // The caller must already hold getMutex(). This avoids self-deadlock in
-    // compound map transactions that need a stable point snapshot.
     std::vector<std::shared_ptr<MapPoint>> copyMapPointsLocked() const
     {
         return map_points_;
@@ -271,13 +256,8 @@ public:
         return pose_graph_constraints_;
     }
 
-    // Rebuild geometry-derived graph measurements after Local BA changed
-    // keyframe poses. Verified loop measurements are intentionally preserved.
     std::size_t refreshPoseGraphMeasurements();
 
-    // Refresh only constraints incident to the supplied keyframes. This is
-    // used by Local BA after a transactional pose commit; loop closing keeps
-    // the full-map overload for its global graph hand-off.
     std::size_t refreshPoseGraphMeasurements(
         const std::vector<std::shared_ptr<Frame>>& dirty_keyframes);
 

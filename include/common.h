@@ -157,8 +157,6 @@ struct LocalBAResult
     int edge_num{0};
     int rejected_edge_num{0};
 
-    // Formal performance accounting. These fields identify whether a slow
-    // Local BA is dominated by snapshot construction, g2o, or map publication.
     double context_build_ms{0.0};
     double graph_build_ms{0.0};
     double solve_ms{0.0};
@@ -184,8 +182,6 @@ struct LocalMappingResult
     std::size_t active_keyframe_num{0};
     std::size_t active_map_point_num{0};
 
-    // Work counters are diagnostic only. They describe the candidate volume
-    // behind the timed Local Mapping phases without affecting any decision.
     std::size_t triangulation_partner_num{0};
     std::size_t triangulation_pair_num{0};
     std::size_t triangulation_candidate_match_num{0};
@@ -207,9 +203,6 @@ struct LocalMappingResult
     bool keyframe_database_registered{false};
     bool loop_keyframe_queued{false};
 
-    // The required mapping phase always runs.  These counters distinguish it
-    // from the ORB-SLAM2-style convergence work, which may yield to a newer
-    // admitted keyframe.
     bool fusion_called{false};
     bool keyframe_cull_called{false};
     bool convergence_skipped_for_pending_keyframe{false};
@@ -223,14 +216,10 @@ struct LocalMappingResult
     double keyframe_commit_duration_ms{0.0};
     double map_point_cull_duration_ms{0.0};
     double triangulation_duration_ms{0.0};
-    // R148 diagnostics split triangulation into matching, reconstruction, and
-    // MapPoint publication. These fields do not affect mapping decisions.
     double triangulation_match_duration_ms{0.0};
     double triangulation_geometry_duration_ms{0.0};
     double triangulation_commit_duration_ms{0.0};
     double fusion_duration_ms{0.0};
-    // R143 diagnostics split fusion work from the covisibility refreshes.
-    // These fields are observational only and do not affect mapping decisions.
     double fusion_pre_graph_duration_ms{0.0};
     double fusion_context_duration_ms{0.0};
     double fusion_forward_duration_ms{0.0};

@@ -39,23 +39,18 @@ public:
     void requestStop();
     void release();
 
-    // These dependencies are configured before start() and are then owned by
-    // Frontend for the whole LocalMapper worker lifetime.
     void setKeyframeDatabase(const std::shared_ptr<BoWVocabulary>& vocabulary,
                              const std::shared_ptr<KeyframeDatabase>& database);
     void setLoopCloser(LoopCloser* loop_closer);
 
-    // A small FIFO absorbs transient Local BA bursts without allowing
-    // unbounded tracking-to-mapping backlog.
     bool insertKeyframe(const LocalMappingInput& input);
     std::shared_ptr<Frame> getLatestScheduledKeyframe(
         const std::shared_ptr<Map>& map) const;
     bool hasPendingKeyframe() const;
+    bool waitUntilIdle();
     bool tryPopFinishedResult(LocalMappingOutput& output);
     bool waitPopFinishedResult(LocalMappingOutput& output);
 
-    // Results are consumed independently from admission.  A completed output
-    // must never stall tracking's next Mapper admission.
     bool acceptKeyframe() const;
     bool isStopped() const;
     bool stopRequested() const;
@@ -216,7 +211,7 @@ private:
     mutable std::weak_ptr<Map> recent_map_;
     mutable std::list<std::shared_ptr<MapPoint>> recent_added_map_points_;
     mutable std::size_t local_mapping_generation_{0};
-    mutable std::atomic_bool processing_new_keyframe_{false};
+    bool processing_new_keyframe_{false};
 };
 
 } // namespace mini_orb_slam

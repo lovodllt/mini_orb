@@ -14,8 +14,6 @@ public:
     ORBExtractor() = default;
 
     bool loadParams(ros::NodeHandle& nh);
-    // ORB-SLAM2 logic reference: monocular initialization uses a separate
-    // extractor configured with 2*nFeatures; normal tracking uses nFeatures.
     void extract(const cv::Mat& img, std::vector<cv::KeyPoint>& keypoints,
                  cv::Mat& descriptors, bool initialization = false) const;
 

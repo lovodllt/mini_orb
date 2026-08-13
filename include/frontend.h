@@ -44,8 +44,6 @@ public:
     ~Frontend();
 
     bool init();
-    // Uses the same frontend processing path as imageCallback(), but does not
-    // create ROS image transport endpoints. Intended for offline benchmarks.
     bool initOffline();
     void run();
     void processImage(const cv::Mat& image, double timestamp);
@@ -238,8 +236,6 @@ private:
     std::shared_ptr<Frame> last_tracked_frame_;
     std::weak_ptr<Frame> tracking_reference_keyframe_;
 
-    // ORB-SLAM2 logic reference: the monocular initializer retains matched
-    // image positions while its reference frame remains unchanged.
     std::size_t initialization_match_reference_id_{std::numeric_limits<std::size_t>::max()};
     std::vector<cv::Point2f> initialization_previous_matched_;
 
@@ -272,9 +268,6 @@ private:
     std::size_t keyframe_weak_insert_num_{0};
     int tmp_lost_max_frames_{5};
     double max_tracking_reproj_error_{8.0};
-    // ORB-SLAM2's TrackLocalMap contract requires at least 30 map-point
-    // inliers for normal tracking. Keep this separate from the higher
-    // relocalization acceptance contract.
     int min_tracking_inliers_{30};
     int min_recovery_inliers_{15};
 
@@ -304,6 +297,7 @@ private:
     bool tracking_full_map_lock_{false};
     bool tracking_diagnostic_logging_{false};
     bool tracking_legacy_live_map_{false};
+    bool tracking_wait_for_local_mapping_idle_{false};
     int deterministic_ransac_seed_{-1};
 };
 

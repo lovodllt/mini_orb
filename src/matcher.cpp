@@ -123,9 +123,6 @@ std::vector<std::pair<int, int>> Matcher::matchFramesForInitialization(
             previous_matched.push_back(keypoint.pt);
     }
 
-    // ORB-SLAM2 logic reference: SearchForInitialization uses TH_LOW=50 and
-    // a 0.9 nearest-neighbour ratio, independently of normal tracking's
-    // descriptor acceptance policy.
     constexpr int kInitializationMaxHammingDistance = 50;
     constexpr float kInitializationRatio = 0.9f;
 

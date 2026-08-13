@@ -33,9 +33,6 @@ bool Camera::loadParams(ros::NodeHandle& nh)
         return false;
     }
 
-    // EuRoC cam0 uses the four-parameter plumb_bob model. Keep the
-    // coefficient count intact so setCalibration can validate all OpenCV
-    // distortion layouts (4, 5, 8, 12 and 14).
     const int distortion_num = static_cast<int>(D_data.size());
     if (distortion_num != 4 && distortion_num != 5 && distortion_num != 8 &&
         distortion_num != 12 && distortion_num != 14)

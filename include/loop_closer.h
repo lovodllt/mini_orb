@@ -223,8 +223,6 @@ private:
     mutable bool finished_{false};
     mutable bool worker_started_{false};
 
-    // ORB-SLAM2 logic reference: a loop candidate must recur in a
-    // covisibility group over consecutive loop checks before verification.
     mutable std::vector<ConsistentLoopGroup> consistent_loop_groups_;
 };
 

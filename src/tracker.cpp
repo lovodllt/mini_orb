@@ -25,8 +25,6 @@ double dotPoint(const cv::Point3d& a, const cv::Point3d& b)
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
-// ORB-SLAM2 logic reference: GetMin/MaxDistanceInvariance adds a 0.8/1.2
-// margin around the reference pyramid-derived range before projection gating.
 double minDistanceInvariance(double min_distance)
 {
     return 0.8 * min_distance;
@@ -37,8 +35,6 @@ double maxDistanceInvariance(double max_distance)
     return 1.2 * max_distance;
 }
 
-// ORB-SLAM2 logic reference: descriptors are 256-bit ORB rows. Keep the
-// same Hamming metric while avoiding a per-candidate OpenCV norm dispatch.
 int orbDescriptorDistance(const cv::Mat& lhs, const cv::Mat& rhs)
 {
     if (lhs.rows != 1 || rhs.rows != 1 || lhs.cols != 32 || rhs.cols != 32 ||
@@ -143,8 +139,6 @@ bool Tracker::getFeatureDescriptor(const std::shared_ptr<Feature>& feature, cv::
     if (feature_idx < 0 || feature_idx >= frame->getDescriptors().rows)
         return false;
 
-    // ORB-SLAM2 logic reference: keep a descriptor row view during matching;
-    // the owning Frame is retained by the Feature and remains alive here.
     descriptor = frame->getDescriptors().row(feature_idx);
     return true;
 }
@@ -194,10 +188,6 @@ bool Tracker::isProjectionMatchReliable(int best_distance,
     if (best_distance > matcher_.getMaxHammingDistance())
         return false;
 
-    // ORB-SLAM2 logic reference: local-map projection matching applies the
-    // configured NN ratio only when the best and second-best features are in
-    // the same pyramid level. Motion-model and relocalization projection
-    // paths intentionally pass apply_ratio_test=false.
     if (apply_ratio_test &&
         second_best_distance != std::numeric_limits<int>::max() &&
         best_level == second_best_level &&
@@ -349,10 +339,6 @@ Tracker::ProjectionFeatureSearchResult Tracker::findBestFeatureInArea(
     const cv::Mat& descriptors = frame->getDescriptors();
 
     const int min_level = std::max(0, predicted_level - 1);
-    // ORB-SLAM2 logic reference: SearchByProjection considers the predicted
-    // octave and the immediately finer octave, never a coarser one. A
-    // coarser candidate is more likely to be a spatially nearby alias after
-    // motion prediction and can perturb the local-map pose refinement.
     const int max_level = std::min(levels_num_ - 1, predicted_level);
 
     const std::vector<int> candidate_indices = frame->getFeatureIndicesInArea(projected_pixel, 
@@ -544,7 +530,7 @@ PnPResult Tracker::trackFrameByMapPoints(const std::vector<std::shared_ptr<MapPo
         }
     }
 
-    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R12 frame="
+    ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame="
                     << (cur_frame != nullptr ? cur_frame->getId() : 0)
                     << " stage=motion_projection input=" << map_points.size()
                     << " visible=" << visible_map_points.size()
@@ -569,7 +555,7 @@ PnPResult Tracker::trackFrameByMapPoints(const std::vector<std::shared_ptr<MapPo
         best_result = std::move(descriptor_result);
     }
 
-    ROS_DEBUG_STREAM("P2-EUROC-DEBUG-R12 frame="
+    ROS_DEBUG_STREAM("P2-SLAM-DEBUG frame="
                     << (cur_frame != nullptr ? cur_frame->getId() : 0)
                     << " stage=motion_final success=" << (best_result.success ? 1 : 0)
                     << " inliers=" << best_result.inlier_num
@@ -1006,7 +992,7 @@ void Tracker::appendProjectionCorrespondences(
 
     if (shouldEmitTrackingDiag(cur_frame))
     {
-        ROS_INFO_STREAM("P2-KITTI-DIAG-R174 frame=" << cur_frame->getId()
+        ROS_INFO_STREAM("P2-SLAM-DIAG frame=" << cur_frame->getId()
                         << " timestamp_ns=" << static_cast<long long>(
                                std::llround(cur_frame->getTimestamp() * 1e9))
                         << " stage=" << (diag_stage != nullptr ? diag_stage : "projection")
@@ -1081,10 +1067,6 @@ PnPResult Tracker::refinePoseWithLocalMap(
     const std::size_t first_pass_correspondences = combined_result.object_points.size();
     double expanded_projection_ms = 0.0;
 
-    // A slightly stale motion prediction can leave otherwise valid map points
-    // just outside the nominal search window. Enlarge the geometric search
-    // only when the first pass is sparse; PnP and reprojection checks still
-    // decide which correspondences are accepted.
     constexpr std::size_t kSparseLocalMapCorrespondences = 50;
     if (combined_result.object_points.size() < kSparseLocalMapCorrespondences)
     {
@@ -1115,7 +1097,7 @@ PnPResult Tracker::refinePoseWithLocalMap(
     const double total_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - refine_start).count();
     ROS_INFO_STREAM_THROTTLE(1.0,
-        "P2-KITTI-PERF-R163 local_refine_phases frame=" << cur_frame->getId()
+        "P2-SLAM-PERF local_refine_phases frame=" << cur_frame->getId()
         << " seed_correspondence_ms=" << seed_correspondence_ms
         << " first_projection_ms=" << first_projection_ms
         << " expanded_projection_ms=" << expanded_projection_ms
@@ -1127,7 +1109,7 @@ PnPResult Tracker::refinePoseWithLocalMap(
         << " success=" << (optimized_result.success ? 1 : 0));
     if (shouldEmitTrackingDiag(cur_frame))
     {
-        ROS_INFO_STREAM("P2-KITTI-DIAG-R174 frame=" << cur_frame->getId()
+        ROS_INFO_STREAM("P2-SLAM-DIAG frame=" << cur_frame->getId()
                         << " stage=local_refine_summary"
                         << " seed_inliers=" << motion_pnp_result.inlier_num
                         << " first_pass_correspondences=" << first_pass_correspondences
